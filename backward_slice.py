@@ -9,28 +9,66 @@ def read_jsonl(path):
     return records
 
 def operation_maps(function):
-    pass
+    operations = {}
+    operation_blocks = {}
+    for block in function['blocks']:
+        for statement in block['statements']:
+            operations[statement['id']] = statement
+            operation_blocks[statement['id']] = block['id']
+        terminator = block['terminator']
+        operations[terminator['id']] = terminator
+        operation_blocks[terminator['id']] = block['id']
+    return operations, operation_blocks
 
 def control_dependencies(function):
     pass
 
 def target_operation(function, target):
-    pass
+    if target.get('operation'):
+        return target['operation']
+    location = target['mir_location']
+    basic_block = location['basic_block']
+    block_id = f'bb{basic_block}'
+    for block in function['blocks']:
+        if block['id'] != block_id:
+            continue
+        if location.get('terminator'):
+            return block['terminator']['id']
+        statement = location.get('statement_index')
+        if statement is not None:
+            return block['statements'][statement]['id']
+    return None
 
 def slice_function(function, dataflow, target):
     operations, operation_blocks = operation_maps(function)
     definitions = {}
+
+    # function definitions
     for definition in function['definitions']:
         definitions[definition['id']] = definition
+    # definitions outsid the function
     for definition in dataflow['argument_definitions']:
         definitions[definition['id']] = definition
 
+    # Reorganize def-use edges
+    # e.g. change
+    # dataflow['edges'] = [
+    #     {'source': 'def1', 'target': 'use1'},
+    #     {'source': 'def2', 'target': 'use1'},
+    #     {'source': 'def3', 'target': 'use2'},
+    # ]
+    # to
+    # reaching = {
+    #     'use1': ['def1', 'def2'],
+    #     'use2': ['def3'],
+    # }
     reaching = {}
     for edge in dataflow['edges']:
         if edge['target'] not in reaching:
             reaching[edge['target']] = []
         reaching[edge['target']].append(edge['source'])
 
+    # Parse control-flow information and find where backward slicing should begin
     dependencies = control_dependencies(function)
     start = target_operation(function, target)
     if start not in operations:
