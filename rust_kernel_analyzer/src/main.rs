@@ -24,7 +24,9 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
-use util::{push_edge, sanitize, source_span, span_json, type_json, unwind_target, SourceSpan};
+use util::{
+    function_id, push_edge, sanitize, source_span, span_json, type_json, unwind_target, SourceSpan,
+};
 
 struct Analysis {
     crate_name: String,
@@ -68,6 +70,7 @@ struct CallSite {
     caller: String,
     call_kind: String,
     callee: Option<String>,
+    callee_id: Option<String>,
     function_operand: String,
     arguments: Vec<String>,
     destination: String,
@@ -187,13 +190,7 @@ fn analyze(tcx: TyCtxt<'_>, output_dir: &PathBuf) -> io::Result<()> {
             // Panic and calls are in the optimized MIR
             let body = tcx.optimized_mir(def_id.to_def_id());
             // Record the CFG
-            cfgs.push(mir_cfg(
-                tcx,
-                body,
-                &crate_name,
-                &function,
-                def_id.local_def_index.as_u32(),
-            ));
+            cfgs.push(mir_cfg(tcx, body, &function, def_id.to_def_id()));
             // Then, scan the MIR for panic and call sites
             analyze_body(tcx, body, &function, &mut panic_sites, &mut calls);
         }
@@ -231,19 +228,16 @@ fn analyze(tcx: TyCtxt<'_>, output_dir: &PathBuf) -> io::Result<()> {
         .map_err(io::Error::other)
 }
 
-fn mir_cfg<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    body: &Body<'tcx>,
-    crate_name: &str,
-    function: &str,
-    def_index: u32,
-) -> Value {
+fn mir_cfg<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, function: &str, def_id: DefId) -> Value {
     let mut blocks = Vec::new();
     let mut edges = Vec::new();
     let mut definitions = Vec::new();
     let mut uses = Vec::new();
     let mut memory_accesses = Vec::new();
-    let function_id = format!("rust:{crate_name}:{def_index}:{function}");
+    // This CFG function ID has the same format as the call record's callee ID
+    let function_id = function_id(tcx, def_id);
+    let def_index = def_id.index.as_u32();
+    let crate_name = tcx.crate_name(def_id.krate).to_string();
 
     for (block, data) in body.basic_blocks.iter_enumerated() {
         let terminator = data.terminator();
@@ -507,8 +501,10 @@ fn terminator_json<'tcx>(
             target,
             ..
         } => {
+            let callee_id = direct_callee(tcx, body, func).map(|def_id| function_id(tcx, def_id));
             data = json!({
                 "callee": operand_json(tcx, body, func),
+                "callee_id": callee_id,
                 "arguments": args.iter().map(|argument| operand_json(tcx, body, &argument.node)).collect::<Vec<_>>(),
                 "destination": place_json(tcx, body, *destination),
             });
@@ -1040,6 +1036,7 @@ fn analysis_json(analysis: &Analysis) -> Value {
                 "caller": call.caller,
                 "call_kind": call.call_kind,
                 "callee": call.callee,
+                "callee_id": call.callee_id,
                 "function_operand": call.function_operand,
                 "arguments": call.arguments,
                 "destination": call.destination,
@@ -1123,6 +1120,7 @@ fn analyze_body<'tcx>(
             } => {
                 let callee = direct_callee(tcx, body, func);
                 let is_panic_sink = callee.is_some_and(|def_id| is_panic_sink(tcx, def_id));
+                let callee_id = callee.map(|def_id| function_id(tcx, def_id));
                 let callee = callee.map(|def_id| tcx.def_path_str(def_id));
                 calls.push(CallSite {
                     id: String::new(),
@@ -1134,6 +1132,7 @@ fn analyze_body<'tcx>(
                     }
                     .into(),
                     callee: callee.clone(),
+                    callee_id,
                     function_operand: format!("{func:?}"),
                     arguments: args
                         .iter()

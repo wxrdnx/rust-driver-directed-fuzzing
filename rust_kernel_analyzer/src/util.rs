@@ -1,5 +1,6 @@
 use rustc_middle::mir::{BasicBlock, UnwindAction};
 use rustc_middle::ty::{IntTy, Ty, TyCtxt, TyKind, UintTy};
+use rustc_span::def_id::DefId;
 use rustc_span::{Pos, Span};
 use serde_json::{json, Value};
 
@@ -23,6 +24,14 @@ pub(crate) fn source_span(tcx: TyCtxt<'_>, span: Span) -> SourceSpan {
 
 pub(crate) fn span_json(span: &SourceSpan) -> Value {
     json!({"file": span.file, "line": span.line, "column": span.column})
+}
+
+// This ID has the same format as the CFG function ID
+pub(crate) fn function_id(tcx: TyCtxt<'_>, def_id: DefId) -> String {
+    let crate_name = tcx.crate_name(def_id.krate);
+    let def_index = def_id.index.as_u32();
+    let function = tcx.def_path_str(def_id);
+    format!("rust:{crate_name}:{def_index}:{function}")
 }
 
 pub(crate) fn type_json(tcx: TyCtxt<'_>, ty: Ty<'_>) -> Value {
