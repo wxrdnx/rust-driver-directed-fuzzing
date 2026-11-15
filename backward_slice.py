@@ -1,4 +1,5 @@
 import argparse
+import json
 
 def read_jsonl(path):
     records = []
@@ -21,7 +22,81 @@ def operation_maps(function):
     return operations, operation_blocks
 
 def control_dependencies(function):
-    pass
+    successors = {}
+    for block in function['blocks']:
+        successors[block['id']] = []
+    for edge in function['edges']:
+        successors[edge['source']].append(edge['target'])
+
+    exit_block = '__exit__'
+    successors[exit_block] = []
+    for block, targets in successors.items():
+        if block != exit_block and not targets:
+            targets.append(exit_block)
+
+    all_blocks = set(successors)
+    postdominators = {}
+    for block in successors:
+        postdominators[block] = set(all_blocks)
+    postdominators[exit_block] = {exit_block}
+
+    changed = True
+    while changed:
+        changed = False
+        for block, targets in successors.items():
+            if block == exit_block:
+                continue
+            common = set(postdominators[targets[0]])
+            for target in targets[1:]:
+                common.intersection_update(postdominators[target])
+            result = {block}
+            result.update(common)
+            if result != postdominators[block]:
+                postdominators[block] = result
+                changed = True
+
+    immediate = {}
+    for block in successors:
+        if block == exit_block:
+            continue
+        candidates = postdominators[block] - {block}
+        for candidate in candidates:
+            closest = True
+            for other in candidates:
+                if other != candidate and candidate in postdominators[other]:
+                    closest = False
+                    break
+            if closest:
+                immediate[block] = candidate
+                break
+
+    dependencies = {}
+    for block in successors:
+        if block != exit_block:
+            dependencies[block] = []
+    blocks = {}
+    for block in function['blocks']:
+        blocks[block['id']] = block
+    for edge in function['edges']:
+        source = edge['source']
+        target = edge['target']
+        if target in postdominators[source]:
+            continue
+        terminator = blocks[source]['terminator']
+        if terminator['kind'] != 'switch':
+            continue
+        runner = target
+        stop = immediate.get(source)
+        while runner != stop and runner != exit_block:
+            dependency = {
+                'operation': terminator['id'],
+                'block': source,
+                'edge': {key: value for key, value in edge.items() if key != 'condition'},
+            }
+            if dependency not in dependencies[runner]:
+                dependencies[runner].append(dependency)
+            runner = immediate.get(runner, exit_block)
+    return dependencies
 
 def target_operation(function, target):
     if target.get('operation'):
