@@ -228,6 +228,11 @@ def analyze(cfg_path, dataflow_path, target_path, output_path):
             if result:
                 slices.append(result)
 
+    with open(output_path, 'w') as output:
+        for result in slices:
+            output.write(json.dumps(result, separators=(',', ':')) + '\n')
+    return bool(slices)
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('cfg')
