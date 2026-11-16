@@ -26,7 +26,10 @@ def operation_maps(function):
         operation_blocks[terminator['id']] = block['id']
     return operations, operation_blocks
 
+# TODO: Interprocedural control dependency analysis
+
 def control_dependencies(function):
+    # Intraprocedural control dependency analysis
     # Determine which branch condition controls which blocks executed
     # e.g.
     # bb0: check size == 0
@@ -68,8 +71,9 @@ def control_dependencies(function):
         for block, targets in successors.items():
             if block == '__exit__':
                 continue
-            common = set(postdominators[targets[0]])
-            for target in targets[1:]:
+            # postdominators(block) = {block} union (postdominators(successor 0) intersect ... intersect postdominators(successor n))
+            common = set(successors)
+            for target in targets:
                 common.intersection_update(postdominators[target])
             result = {block}
             result.update(common)
@@ -90,7 +94,7 @@ def control_dependencies(function):
     #  __exit__
     # In this case  bb1, bb4, and __exit are all bb0's post-dominator
     # But bb1 is the closest, so the closest post-dominator of bb0 is bb1
-    immediate = {}
+    immediate_postdominator = {}
     for block in successors:
         if block == '__exit__':
             continue
@@ -102,7 +106,7 @@ def control_dependencies(function):
                     closest = False
                     break
             if closest:
-                immediate[block] = candidate
+                immediate_postdominator[block] = candidate
                 break
 
     dependencies = {}
@@ -116,7 +120,7 @@ def control_dependencies(function):
         blocks[block['id']] = block
 
     # Examine every CFG edge and find SwitchInt
-    # Only switch conditions need to be handled because it's the main representation for branches
+    # Currently we only deal with control dependencies of "regular" branches
     for edge in function['edges']:
         source = edge['source']
         target = edge['target']
@@ -129,7 +133,7 @@ def control_dependencies(function):
         # These all becomes SwitchInt in the MIR representation
         if terminator['kind'] == 'switch':
             runner = target
-            stop = immediate.get(source)
+            stop = immediate_postdominator.get(source)
             while runner != stop and runner != '__exit__':
                 dependency = {
                     'operation': terminator['id'],
@@ -138,47 +142,113 @@ def control_dependencies(function):
                 }
                 if dependency not in dependencies[runner]:
                     dependencies[runner].append(dependency)
-                runner = immediate.get(runner, '__exit__')
+                runner = immediate_postdominator.get(runner, '__exit__')
         else:
             # TODO: other kinds
             pass
     return dependencies
 
-def target_operation(function, target):
-    if target.get('operation'):
-        return target['operation']
-    location = target['mir_location']
-    basic_block = location['basic_block']
-    block_id = f'bb{basic_block}'
-    for block in function['blocks']:
-        if block['id'] != block_id:
-            continue
-        if location.get('terminator'):
-            return block['terminator']['id']
-        statement = location.get('statement_index')
-        if statement is not None:
-            return block['statements'][statement]['id']
-    return None
-
 def build_program_index(functions, dataflows):
+    # Reorganize CFG + DFG into lookup tables used by interprocedural backward slicing
+    # Repeatedly scanning lists during slicing is too slow
+    # So we build a dictionary indexed by IDs instead
+
     dataflow_by_function = {}
     for dataflow in dataflows:
         dataflow_by_function[dataflow['function']['id']] = dataflow
+
+    # indexes contains analysis information for every function
+
+    # e.g.
+    # fn helper(value: usize) -> usize {
+    #     value + 1
+    # }
+    # fn caller_a(input: usize) {
+    #     let result = helper(input);
+    # }
+    # fn caller_b(size: usize) {
+    #     let result = helper(size);
+    # }
+    #
+    # For the helper function, the result will be
+    #
+    # indexes = {
+    #     'helper': {
+    #         'operations': {
+    #             'helper:bb0:stmt0': {'kind': 'assignment'},
+    #             'helper:bb0:term': {'kind': 'return'},
+    #         },
+    #         'operation_blocks': {
+    #             'helper:bb0:stmt0': 'bb0',
+    #             'helper:bb0:term': 'bb0',
+    #         },
+    #         'definitions': {
+    #             'helper:bb0:stmt0:def': {'operation': 'helper:bb0:stmt0'},
+    #         },
+    #         'uses': {
+    #             'helper:bb0:term:use0': {'role': 'return_value'},
+    #         },
+    #         'returns': [('helper:bb0:term', 'helper:bb0:term:use0')],
+    #         'reaching': {
+    #             'helper:bb0:term:use0': ['helper:bb0:stmt0:def'],
+    #         },
+    #         'dependencies': {
+    #             'bb0': [],
+    #         },
+    #     }
+    # }
     indexes = {}
+
+    # callers maps each callee to its call sites
+
+    # e.g.
+    # fn helper(value: usize) -> usize {
+    #     value + 1
+    # }
+    # fn caller_a(input: usize) {
+    #     let result = helper(input);
+    # }
+    # fn caller_b(size: usize) {
+    #     let result = helper(size);
+    # }
+    # Then helper is the callee, and caller_a and caller_b each contains a call site that calls helper
+    # 
+    # The result will be
+    # callers = {
+    #     'helper': [
+    #         {
+    #             'function': 'caller_a',
+    #             'operation': 'caller_a:bb0:term',
+    #             'arguments': {
+    #                 0: 'caller_a:bb0:term:use0',
+    #             },
+    #         },
+    #         {
+    #             'function': 'caller_b',
+    #             'operation': 'caller_b:bb2:term',
+    #             'arguments': {
+    #                 0: 'caller_b:bb2:term:use0',
+    #             },
+    #         },
+    #     ]
+    # }
+
     callers = {}
+
     for function in functions:
         function_id = function['function']['id']
-        if function_id not in dataflow_by_function:
-            continue
         dataflow = dataflow_by_function[function_id]
         operations, operation_blocks = operation_maps(function)
         definitions = {}
         uses = {}
         returns = []
+
+        # Combine MIR definitions and argument pseudo-definitions
         for definition in function['definitions']:
             definitions[definition['id']] = definition
         for definition in dataflow['argument_definitions']:
             definitions[definition['id']] = definition
+
         for operation in operations.values():
             for use in operation.get('uses', []):
                 uses[use['id']] = use
@@ -216,14 +286,26 @@ def build_program_index(functions, dataflows):
             callers[callee_id].append({'function': function_id, 'operation': operation['id'], 'arguments': arguments})
     return indexes, callers
 
-def slice_program(functions, dataflows, target_function, target, program=None):
-    if program is None:
-        program = build_program_index(functions, dataflows)
+def slice_program(program, target_function, target):
     indexes, callers = program
     target_function_id = target_function['function']['id']
     if target_function_id not in indexes:
         return None
-    start = target_operation(target_function, target)
+    start = target.get('operation')
+    if not start:
+        location = target['mir_location']
+        basic_block = location['basic_block']
+        block_id = f'bb{basic_block}'
+        for block in target_function['blocks']:
+            if block['id'] != block_id:
+                continue
+            if location.get('terminator'):
+                start = block['terminator']['id']
+            else:
+                statement_index = location.get('statement_index')
+                if statement_index is not None:
+                    start = block['statements'][statement_index]['id']
+            break
     if start not in indexes[target_function_id]['operations']:
         return None
 
@@ -350,7 +432,8 @@ def slice_program(functions, dataflows, target_function, target, program=None):
     }
 
 def slice_function(function, dataflow, target):
-    return slice_program([function], [dataflow], function, target)
+    program = build_program_index([function], [dataflow])
+    return slice_program(program, function, target)
 
 def analyze(cfg_path, dataflow_path, target_path, output_path):
     cfgs = read_jsonl(cfg_path)
@@ -380,7 +463,7 @@ def analyze(cfg_path, dataflow_path, target_path, output_path):
             function_id = function['function']['id']
             if function_id not in dataflow_by_function:
                 continue
-            result = slice_program(cfgs, dataflows, function, target, program)
+            result = slice_program(program, function, target)
             if result:
                 slices.append(result)
 
