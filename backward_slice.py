@@ -1,6 +1,11 @@
 import argparse
 import json
 
+# Number of recent call sites used to distinguish visited states
+CALL_CONTEXT_DEPTH = 2
+# Maximum number of call sites kept in a recorded call path
+MAX_CALL_PATH_DEPTH = 16
+
 def read_jsonl(path):
     records = []
     with open(path) as file:
@@ -229,11 +234,13 @@ def slice_program(functions, dataflows, target_function, target, program=None):
     selected_inputs = set()
     unresolved = set()
     conditions = {}
+    call_paths = set()
     visited = set()
-    pending = [(target_function_id, start, None)]
+    pending = [(target_function_id, start, None, ())]
     while pending:
-        function_id, operation_id, selected_use = pending.pop()
-        work = function_id, operation_id, selected_use
+        function_id, operation_id, selected_use, call_path = pending.pop()
+        context = tuple(frame[1] for frame in call_path[-CALL_CONTEXT_DEPTH:])
+        work = function_id, operation_id, selected_use, context
         if work in visited:
             continue
         visited.add(work)
@@ -246,7 +253,7 @@ def slice_program(functions, dataflows, target_function, target, program=None):
         for dependency in index['dependencies'][block_id]:
             condition_id = dependency['operation']
             conditions[condition_id] = dependency
-            pending.append((function_id, condition_id, None))
+            pending.append((function_id, condition_id, None, call_path))
 
         operation_uses = operation.get('uses', [])
         if selected_use is False:
@@ -264,16 +271,34 @@ def slice_program(functions, dataflows, target_function, target, program=None):
                 definition = index['definitions'][definition_id]
                 if definition.get('kind') == 'argument':
                     argument_index = definition.get('argument_index')
-                    if argument_index is None:
-                        argument_index = int(definition_id.rsplit(':argument:', 1)[1])
                     mapped = False
-                    for call in callers.get(function_id, []):
+                    possible_callers = callers.get(function_id, [])
+                    matching_callers = []
+                    next_path = None
+                    if call_path and call_path[-1][2] == function_id:
+                        frame = call_path[-1]
+                        for call in possible_callers:
+                            if call['function'] == frame[0] and call['operation'] == frame[1]:
+                                matching_callers.append(call)
+                        next_path = call_path[:-1]
+                    else:
+                        matching_callers = possible_callers
+                    for call in matching_callers:
                         caller_use = call['arguments'].get(argument_index)
                         if caller_use:
-                            pending.append((call['function'], call['operation'], caller_use))
+                            path = next_path
+                            if path is None:
+                                frame = call['function'], call['operation'], function_id
+                                path = (call_path + (frame,))
+                                path = path[-MAX_CALL_PATH_DEPTH:]
+                            pending.append((call['function'], call['operation'], caller_use, path))
+                            if path:
+                                call_paths.add(path)
                             mapped = True
                     if not mapped:
                         selected_inputs.add(definition_id)
+                        if call_path:
+                            call_paths.add(call_path)
                     continue
                 defining_operation = definition.get('operation')
                 if defining_operation:
@@ -291,15 +316,26 @@ def slice_program(functions, dataflows, target_function, target, program=None):
                         data = defining.get('data') or {}
                         callee_id = data.get('callee_id')
                         if callee_id in indexes and indexes[callee_id]['returns']:
-                            pending.append((function_id, defining_operation, False))
+                            pending.append((function_id, defining_operation, False, call_path))
+                            frame = function_id, defining_operation, callee_id
+                            callee_path = (call_path + (frame,))
+                            callee_path = callee_path[-MAX_CALL_PATH_DEPTH:]
+                            call_paths.add(callee_path)
                             for return_operation, return_use in indexes[callee_id]['returns']:
-                                pending.append((callee_id, return_operation, return_use))
+                                pending.append((callee_id, return_operation, return_use, callee_path))
                             continue
 
                     # For other ordinary assignments like
                     #     let foo = bar + 1
                     # Adds the entire assignment operation
-                    pending.append((function_id, defining_operation, None))
+                    pending.append((function_id, defining_operation, None, call_path))
+
+    formatted_paths = []
+    for path in sorted(call_paths):
+        formatted = []
+        for caller, operation, callee in path:
+            formatted.append({'caller': caller, 'operation': operation, 'callee': callee})
+        formatted_paths.append(formatted)
 
     return {
         'target': target,
@@ -310,6 +346,7 @@ def slice_program(functions, dataflows, target_function, target, program=None):
         'control_conditions': list(conditions.values()),
         'inputs': sorted(selected_inputs),
         'unresolved': sorted(unresolved),
+        'call_paths': formatted_paths,
     }
 
 def slice_function(function, dataflow, target):
