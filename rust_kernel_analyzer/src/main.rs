@@ -242,7 +242,7 @@ fn mir_cfg<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, function: &str, def_id: D
     for (block, data) in body.basic_blocks.iter_enumerated() {
         let terminator = data.terminator();
         let span = source_span(tcx, terminator.source_info.span);
-        let statements = data
+        let statements: Vec<_> = data
             .statements
             .iter()
             .enumerate()
@@ -259,7 +259,7 @@ fn mir_cfg<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, function: &str, def_id: D
                     &mut memory_accesses,
                 )
             })
-            .collect::<Vec<_>>();
+            .collect();
         let terminator_record = terminator_json(
             tcx,
             body,
@@ -279,11 +279,17 @@ fn mir_cfg<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, function: &str, def_id: D
             "span": span_json(&span),
         }));
 
+        // CFG edges
         match &terminator.kind {
             TerminatorKind::Goto { target } => {
                 push_edge(&mut edges, block.index(), target.index(), "goto", None)
             }
             TerminatorKind::SwitchInt { discr, targets } => {
+                // SwitchInt follows the matching value, or otherwise when no value matches
+                // e.g. switchInt(value) -> [0: bb1, 1: bb2, otherwise: bb3]
+                // value 0 follows bb1, value 1 follows bb2, and every other value follows bb3
+
+                // Handle explicit definitions (the non-otherwise case)
                 for (value, target) in targets.iter() {
                     edges.push(json!({
                         "source": format!("bb{}", block.index()),
@@ -293,6 +299,7 @@ fn mir_cfg<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, function: &str, def_id: D
                         "condition": operand_json(tcx, body, discr),
                     }));
                 }
+                // Handle the fallback definition (the otherwise case)
                 edges.push(json!({
                     "source": format!("bb{}", block.index()),
                     "target": format!("bb{}", targets.otherwise().index()),
@@ -301,6 +308,15 @@ fn mir_cfg<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, function: &str, def_id: D
                 }));
             }
             TerminatorKind::Call { target, unwind, .. } => {
+                // Here we handle functions that return normally
+                // e.g.
+                // bb0 call helper() -> helper returns -> bb1 follows after bb0
+                // Then it adds
+                // {
+                //     "source": "bb0",
+                //     "target": "bb1",
+                //     "kind": "call_return" ,
+                // }
                 if let Some(target) = target {
                     push_edge(
                         &mut edges,
@@ -310,6 +326,15 @@ fn mir_cfg<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, function: &str, def_id: D
                         None,
                     );
                 }
+                // Some functions never return
+                // e.g.
+                // bb0 call helper() -> helper panics -> bb2 cleanup local variables
+                // Then it adds
+                // {
+                //     "source": "bb0",
+                //     "target": "bb2",
+                //     "kind": "unwind" ,
+                // }
                 if let Some(target) = unwind_target(unwind) {
                     push_edge(&mut edges, block.index(), target.index(), "unwind", None);
                 }
@@ -321,6 +346,16 @@ fn mir_cfg<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, function: &str, def_id: D
                 unwind,
                 ..
             } => {
+                // Assert is similar to
+                // if condition == expected {
+                //     // continue
+                // }
+                // else {
+                //     // panic
+                // }
+                // e.g. assert!(size > 0)
+                // produces MIR similar to
+                // assert(_1 > 0) -> [success: bb1, unwind: bb2]
                 let condition =
                     Some(json!({"condition": operand_json(tcx, body, cond), "expected": expected}));
                 push_edge(
@@ -335,6 +370,9 @@ fn mir_cfg<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, function: &str, def_id: D
                 }
             }
             TerminatorKind::Drop { target, unwind, .. } => {
+                // Drop runs the value's destructor and then follows the return target
+                // e.g. drop(_1) -> [return: bb1, unwind: bb2]
+                // bb1 follows when the destructor finishes, while bb2 handles a panic during drop
                 push_edge(
                     &mut edges,
                     block.index(),
@@ -395,7 +433,11 @@ fn locals_json(tcx: TyCtxt<'_>, body: &Body<'_>) -> Vec<Value> {
         .iter_enumerated()
         .map(|(local, declaration)| {
             let index = local.index();
-            let argument_index = if index > 0 && index <= body.arg_count { Some(index - 1) } else { None };
+            let argument_index = match index {
+                // MIR starts at index 1, 
+                index if index > 0 && index <= body.arg_count => Some(index - 1),
+                _ => None,
+            };
             json!({
                 "id": format!("_{index}"),
                 "kind": if index == 0 { "return" } else if index <= body.arg_count { "argument" } else { "local" },
