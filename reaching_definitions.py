@@ -69,6 +69,7 @@ def argument_definitions(function):
         definitions.append({
             'id': f'{function_id}:argument:{argument}',
             'kind': 'argument',
+            'argument_index': argument,
             'place': {'kind': 'place', 'local': local['id'], 'projections': [], 'type': local['type']},
         })
     return definitions

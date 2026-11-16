@@ -169,6 +169,7 @@ def build_program_index(functions, dataflows):
         operations, operation_blocks = operation_maps(function)
         definitions = {}
         uses = {}
+        returns = []
         for definition in function['definitions']:
             definitions[definition['id']] = definition
         for definition in dataflow['argument_definitions']:
@@ -176,6 +177,8 @@ def build_program_index(functions, dataflows):
         for operation in operations.values():
             for use in operation.get('uses', []):
                 uses[use['id']] = use
+                if operation['kind'] == 'return' and use.get('role') == 'return_value':
+                    returns.append((operation['id'], use['id']))
         reaching = {}
         for edge in dataflow['edges']:
             if edge['target'] not in reaching:
@@ -186,6 +189,7 @@ def build_program_index(functions, dataflows):
             'operation_blocks': operation_blocks,
             'definitions': definitions,
             'uses': uses,
+            'returns': returns,
             'reaching': reaching,
             'dependencies': control_dependencies(function),
         }
@@ -245,7 +249,9 @@ def slice_program(functions, dataflows, target_function, target, program=None):
             pending.append((function_id, condition_id, None))
 
         operation_uses = operation.get('uses', [])
-        if selected_use:
+        if selected_use is False:
+            operation_uses = []
+        elif selected_use is not None:
             operation_uses = [index['uses'][selected_use]]
         for use in operation_uses:
             use_id = use['id']
@@ -271,6 +277,28 @@ def slice_program(functions, dataflows, target_function, target, program=None):
                     continue
                 defining_operation = definition.get('operation')
                 if defining_operation:
+                    defining = index['operations'][defining_operation]
+
+                    # Interprocedural return value mapping
+
+                    # For function assignments like
+                    #     let result = calculate(num)
+                    # In this case reult is defined by the call
+                    #     result <- call calculate(num)
+                    # But in fact, the actual value comes from _0
+                    #     result <- callee _0
+                    if definition.get('role') == 'return_value' and defining['kind'] == 'call':
+                        data = defining.get('data') or {}
+                        callee_id = data.get('callee_id')
+                        if callee_id in indexes and indexes[callee_id]['returns']:
+                            pending.append((function_id, defining_operation, False))
+                            for return_operation, return_use in indexes[callee_id]['returns']:
+                                pending.append((callee_id, return_operation, return_use))
+                            continue
+
+                    # For other ordinary assignments like
+                    #     let foo = bar + 1
+                    # Adds the entire assignment operation
                     pending.append((function_id, defining_operation, None))
 
     return {

@@ -14,7 +14,7 @@ use rustc_hir::LangItem;
 use rustc_interface::interface;
 use rustc_middle::mir::{
     AssertKind, Body, NonDivergingIntrinsic, Operand, Place, ProjectionElem, Rvalue, StatementKind,
-    TerminatorKind,
+    TerminatorKind, RETURN_PLACE,
 };
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
@@ -626,6 +626,19 @@ fn terminator_json<'tcx>(
                 *place,
                 &id,
                 "drop",
+                uses,
+                memory_accesses,
+                &mut operation_uses,
+            );
+        }
+        // Use !body.return_ty().is_unit() to not treat a unit return value () as a meaningful data
+        TerminatorKind::Return if !body.return_ty().is_unit() => {
+            record_place_use(
+                tcx,
+                body,
+                Place::from(RETURN_PLACE),
+                &id,
+                "return_value",
                 uses,
                 memory_accesses,
                 &mut operation_uses,
