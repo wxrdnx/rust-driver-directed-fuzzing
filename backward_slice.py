@@ -101,12 +101,13 @@ class FunctionSummaries:
         self.cache[function_id] = summary
         return summary
 
-    def argument_indices(self, summary):
+    def argument_nodes(self, summary):
         arguments = []
         for node in summary['nodes']:
             if node['kind'] == 'argument':
-                arguments.append(node['index'])
-        return sorted(arguments)
+                arguments.append(node)
+        arguments.sort(key=lambda node: node['index'])
+        return arguments
 
     def build(self, function_id):
         index = self.indexes[function_id]
@@ -141,6 +142,7 @@ class FunctionSummaries:
             else:
                 node['function'] = selected_use
                 node['operation'] = item_id
+                node['argument_bindings'] = []
             nodes[node_id] = node
             if expand:
                 pending.append(identity)
@@ -195,11 +197,19 @@ class FunctionSummaries:
                             role = use.get('role', '')
                             if role.startswith('argument_'):
                                 call_arguments[int(role.removeprefix('argument_'))] = use['id']
-                        for argument_index in self.argument_indices(callee):
+                        for argument in self.argument_nodes(callee):
+                            argument_index = argument['index']
                             if argument_index not in call_arguments:
                                 return None
                             child = add_node('use', call_arguments[argument_index])
                             add_edge(nested, child, 'all_of', 'summary_argument')
+                            binding = {
+                                'summary_node': argument['id'],
+                                'index': argument_index,
+                                'target': child,
+                            }
+                            if binding not in nodes[nested]['argument_bindings']:
+                                nodes[nested]['argument_bindings'].append(binding)
                         continue
                 child = add_node('operation', defining_operation)
                 add_edge(node_id, child, 'all_of', 'definition')
@@ -336,7 +346,7 @@ class DependencyGraph:
             'callee': callee_id,
             'call_stack': self.stacks.name(call_stack),
             'call_context': self.contexts.name(call_context),
-            'arguments': {},
+            'argument_bindings': [],
         }
         return node_id
 
@@ -391,14 +401,15 @@ class DependencyGraph:
                 self.add_edge(node_id, child, 'all_of', 'call')
                 summary = self.summaries.get(callee_id)
                 if summary is not None:
-                    summary_arguments = self.summaries.argument_indices(summary)
+                    summary_arguments = self.summaries.argument_nodes(summary)
                     call_arguments = {}
                     for use in defining.get('uses', []):
                         role = use.get('role', '')
                         if role.startswith('argument_'):
                             call_arguments[int(role.removeprefix('argument_'))] = use['id']
                     complete = True
-                    for argument_index in summary_arguments:
+                    for argument in summary_arguments:
+                        argument_index = argument['index']
                         if argument_index not in call_arguments:
                             complete = False
                             break
@@ -407,11 +418,18 @@ class DependencyGraph:
                         summary_node = self.add_summary(summary)
                         self.add_edge(node_id, instance, 'all_of', 'return_summary')
                         self.add_edge(instance, summary_node, 'all_of', 'summary')
-                        for argument_index in summary_arguments:
+                        for argument in summary_arguments:
+                            argument_index = argument['index']
                             caller_use = call_arguments[argument_index]
                             child = self.add_node('operation', function_id, defining_operation, caller_use, call_stack, call_context)
                             self.add_edge(instance, child, 'all_of', 'summary_argument')
-                            self.nodes[instance]['arguments'][str(argument_index)] = child
+                            binding = {
+                                'summary_node': argument['id'],
+                                'index': argument_index,
+                                'target': child,
+                            }
+                            if binding not in self.nodes[instance]['argument_bindings']:
+                                self.nodes[instance]['argument_bindings'].append(binding)
                         return
                 frame = function_id, defining_operation, callee_id
                 # TODO: Use fixed-point SCC summaries to preserve recursive dependencies instead of cutting them off
