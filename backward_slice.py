@@ -3,7 +3,7 @@ import json
 
 # Number of recent call sites used to distinguish visited states
 CALL_CONTEXT_DEPTH = 2
-# Maximum number of call sites kept in a recorded call path
+# Maximum number of call sites kept in a call stack or recorded call path
 MAX_CALL_PATH_DEPTH = 16
 
 def read_jsonl(path):
@@ -25,6 +25,17 @@ def operation_maps(function):
         operations[terminator['id']] = terminator
         operation_blocks[terminator['id']] = block['id']
     return operations, operation_blocks
+
+def extend_call_history(call_history, frame):
+    if not call_history:
+        return (frame,)
+    if call_history[-1][2] == frame[0]:
+        call_history = call_history + (frame,)
+        return call_history[-MAX_CALL_PATH_DEPTH:]
+    if frame[2] == call_history[0][0]:
+        call_history = (frame,) + call_history
+        return call_history[-MAX_CALL_PATH_DEPTH:]
+    return (frame,)
 
 # TODO: Interprocedural control dependency analysis
 
@@ -318,10 +329,13 @@ def slice_program(program, target_function, target):
     conditions = {}
     call_paths = set()
     visited = set()
-    pending = [(target_function_id, start, None, ())]
+    pending = [(target_function_id, start, None, (), ())]
     while pending:
-        function_id, operation_id, selected_use, call_path = pending.pop()
-        context = tuple(frame[1] for frame in call_path[-CALL_CONTEXT_DEPTH:])
+        function_id, operation_id, selected_use, call_stack, call_history = pending.pop()
+        context = []
+        for frame in call_stack[-CALL_CONTEXT_DEPTH:]:
+            context.append(frame[1])
+        context = tuple(context)
         work = function_id, operation_id, selected_use, context
         if work in visited:
             continue
@@ -335,7 +349,7 @@ def slice_program(program, target_function, target):
         for dependency in index['dependencies'][block_id]:
             condition_id = dependency['operation']
             conditions[condition_id] = dependency
-            pending.append((function_id, condition_id, None, call_path))
+            pending.append((function_id, condition_id, None, call_stack, call_history))
 
         operation_uses = operation.get('uses', [])
         if selected_use is False:
@@ -356,31 +370,32 @@ def slice_program(program, target_function, target):
                     mapped = False
                     possible_callers = callers.get(function_id, [])
                     matching_callers = []
-                    next_path = None
-                    if call_path and call_path[-1][2] == function_id:
-                        frame = call_path[-1]
+                    next_stack = call_stack
+                    matched_stack = False
+                    if call_stack and call_stack[-1][2] == function_id:
+                        frame = call_stack[-1]
                         for call in possible_callers:
                             if call['function'] == frame[0] and call['operation'] == frame[1]:
                                 matching_callers.append(call)
-                        next_path = call_path[:-1]
+                        next_stack = call_stack[:-1]
+                        matched_stack = True
                     else:
                         matching_callers = possible_callers
                     for call in matching_callers:
                         caller_use = call['arguments'].get(argument_index)
                         if caller_use:
-                            path = next_path
-                            if path is None:
+                            history = call_history
+                            if not matched_stack:
                                 frame = call['function'], call['operation'], function_id
-                                path = (call_path + (frame,))
-                                path = path[-MAX_CALL_PATH_DEPTH:]
-                            pending.append((call['function'], call['operation'], caller_use, path))
-                            if path:
-                                call_paths.add(path)
+                                history = extend_call_history(call_history, frame)
+                            pending.append((call['function'], call['operation'], caller_use, next_stack, history))
+                            if history:
+                                call_paths.add(history)
                             mapped = True
                     if not mapped:
                         selected_inputs.add(definition_id)
-                        if call_path:
-                            call_paths.add(call_path)
+                        if call_history:
+                            call_paths.add(call_history)
                     continue
                 defining_operation = definition.get('operation')
                 if defining_operation:
@@ -398,19 +413,20 @@ def slice_program(program, target_function, target):
                         data = defining.get('data') or {}
                         callee_id = data.get('callee_id')
                         if callee_id in indexes and indexes[callee_id]['returns']:
-                            pending.append((function_id, defining_operation, False, call_path))
+                            pending.append((function_id, defining_operation, False, call_stack, call_history))
                             frame = function_id, defining_operation, callee_id
-                            callee_path = (call_path + (frame,))
-                            callee_path = callee_path[-MAX_CALL_PATH_DEPTH:]
-                            call_paths.add(callee_path)
+                            callee_stack = call_stack + (frame,)
+                            callee_stack = callee_stack[-MAX_CALL_PATH_DEPTH:]
+                            callee_history = extend_call_history(call_history, frame)
+                            call_paths.add(callee_history)
                             for return_operation, return_use in indexes[callee_id]['returns']:
-                                pending.append((callee_id, return_operation, return_use, callee_path))
+                                pending.append((callee_id, return_operation, return_use, callee_stack, callee_history))
                             continue
 
                     # For other ordinary assignments like
                     #     let foo = bar + 1
                     # Adds the entire assignment operation
-                    pending.append((function_id, defining_operation, None, call_path))
+                    pending.append((function_id, defining_operation, None, call_stack, call_history))
 
     formatted_paths = []
     for path in sorted(call_paths):
