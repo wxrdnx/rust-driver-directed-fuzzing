@@ -2,6 +2,68 @@ import argparse
 import json
 import os
 
+SHARD_SIZE = 50000
+
+class ContextTable:
+    def __init__(self):
+        self.records = [{'id': 'context-0', 'parent': None, 'direction': None, 'frame': None}]
+        self.transitions = {}
+
+    def extend(self, context_id, direction, frame):
+        transition = context_id, direction, frame
+        if transition in self.transitions:
+            return self.transitions[transition]
+        next_id = len(self.records)
+        caller, operation, callee = frame
+        self.transitions[transition] = next_id
+        self.records.append({
+            'id': f'context-{next_id}',
+            'parent': f'context-{context_id}',
+            'direction': direction,
+            'frame': {'caller': caller, 'operation': operation, 'callee': callee},
+        })
+        return next_id
+
+    def contains(self, context_id, frame):
+        while context_id:
+            record = self.records[context_id]
+            value = record['frame']
+            if (value['caller'], value['operation'], value['callee']) == frame:
+                return True
+            context_id = int(record['parent'].removeprefix('context-'))
+        return False
+
+class StackTable:
+    def __init__(self):
+        self.records = [{'id': 'stack-0', 'parent': None, 'frame': None, 'context': None}]
+        self.transitions = {}
+
+    def push(self, stack_id, frame, context_id):
+        transition = stack_id, frame, context_id
+        if transition in self.transitions:
+            return self.transitions[transition]
+        next_id = len(self.records)
+        caller, operation, callee = frame
+        self.transitions[transition] = next_id
+        self.records.append({
+            'id': f'stack-{next_id}',
+            'parent': f'stack-{stack_id}',
+            'frame': {'caller': caller, 'operation': operation, 'callee': callee},
+            'context': f'context-{context_id}',
+        })
+        return next_id
+
+    def top(self, stack_id):
+        record = self.records[stack_id]
+        frame = record['frame']
+        return frame['caller'], frame['operation'], frame['callee']
+
+    def pop(self, stack_id):
+        record = self.records[stack_id]
+        parent = int(record['parent'].removeprefix('stack-'))
+        context = int(record['context'].removeprefix('context-'))
+        return parent, context
+
 class DependencyGraph:
     def __init__(self, program):
         self.indexes, self.callers = program
@@ -10,13 +72,31 @@ class DependencyGraph:
         self.edges = []
         self.edge_ids = set()
         self.pending = []
-        self.contexts = {}
-        self.stacks = {}
+        self.contexts = ContextTable()
+        self.stacks = StackTable()
 
-    def frames_id(self, records, frames, prefix):
-        if frames not in records:
-            records[frames] = f'{prefix}-{len(records) + 1}'
-        return records[frames]
+    def add_target(self, target_function, target):
+        function_id = target_function['function']['id']
+        if function_id not in self.indexes:
+            return None
+        operation_id = target.get('operation')
+        if not operation_id:
+            location = target['mir_location']
+            basic_block = location['basic_block']
+            block_id = f'bb{basic_block}'
+            for block in target_function['blocks']:
+                if block['id'] != block_id:
+                    continue
+                if location.get('terminator'):
+                    operation_id = block['terminator']['id']
+                else:
+                    statement_index = location.get('statement_index')
+                    if statement_index is not None:
+                        operation_id = block['statements'][statement_index]['id']
+                break
+        if operation_id not in self.indexes[function_id]['operations']:
+            return None
+        return self.add_node('operation', function_id, operation_id, None, 0, 0)
 
     def add_node(self, kind, function_id, item_id, selected_use, call_stack, call_context):
         identity = kind, function_id, item_id, selected_use, call_stack, call_context
@@ -30,8 +110,8 @@ class DependencyGraph:
             'function': function_id,
             'item': item_id,
             'selected_use': selected_use,
-            'call_stack': self.frames_id(self.stacks, call_stack, 'stack'),
-            'call_context': self.frames_id(self.contexts, call_context, 'context'),
+            'call_stack': f'stack-{call_stack}',
+            'call_context': f'context-{call_context}',
         }
         self.pending.append(identity)
         return node_id
@@ -53,7 +133,7 @@ class DependencyGraph:
         self.nodes[node_id] = {
             'id': node_id,
             'kind': 'recursion_cutoff',
-            'call_context': self.frames_id(self.contexts, context, 'context'),
+            'call_context': f'context-{context}',
             'frame': {'caller': caller, 'operation': operation, 'callee': callee},
         }
         return node_id
@@ -109,12 +189,12 @@ class DependencyGraph:
                 self.add_edge(node_id, child, 'all_of', 'call')
                 frame = function_id, defining_operation, callee_id
                 # TODO: Use fixed-point SCC summaries to preserve recursive dependencies instead of cutting them off
-                if frame in call_context:
+                if self.contexts.contains(call_context, frame):
                     child = self.add_cutoff(call_context, frame)
                     self.add_edge(node_id, child, 'one_of', 'return_value')
                     return
-                callee_stack = call_stack + (frame,)
-                callee_context = call_context + (frame,)
+                callee_stack = self.stacks.push(call_stack, frame, call_context)
+                callee_context = self.contexts.extend(call_context, 'append', frame)
                 for return_operation, return_use in self.indexes[callee_id]['returns']:
                     child = self.add_node('operation', callee_id, return_operation, return_use, callee_stack, callee_context)
                     self.add_edge(node_id, child, 'one_of', 'return_value')
@@ -129,13 +209,12 @@ class DependencyGraph:
         next_stack = call_stack
         next_context = call_context
         matched_stack = False
-        if call_stack and call_stack[-1][2] == function_id:
-            frame = call_stack[-1]
+        if call_stack and self.stacks.top(call_stack)[2] == function_id:
+            frame = self.stacks.top(call_stack)
             for call in possible_callers:
                 if call['function'] == frame[0] and call['operation'] == frame[1]:
                     matching_callers.append(call)
-            next_stack = call_stack[:-1]
-            next_context = call_context[:-1]
+            next_stack, next_context = self.stacks.pop(call_stack)
             matched_stack = True
         else:
             matching_callers = possible_callers
@@ -147,35 +226,53 @@ class DependencyGraph:
             context = next_context
             if not matched_stack:
                 frame = call['function'], call['operation'], function_id
-                if frame in call_context:
+                if self.contexts.contains(call_context, frame):
                     child = self.add_cutoff(call_context, frame)
                     self.add_edge(node_id, child, 'one_of', 'caller')
                     mapped = True
                     continue
-                context = (frame,) + call_context
+                context = self.contexts.extend(call_context, 'prepend', frame)
             child = self.add_node('operation', call['function'], call['operation'], caller_use, next_stack, context)
             self.add_edge(node_id, child, 'one_of', 'caller')
             mapped = True
         if not mapped:
             self.nodes[node_id]['external_input'] = True
 
-    def formatted_frames(self, records):
-        groups = []
-        for frames, group_id in records.items():
-            formatted = []
-            for frame in frames:
-                formatted.append({'caller': frame[0], 'operation': frame[1], 'callee': frame[2]})
-            groups.append({'id': group_id, 'frames': formatted})
-        return groups
-
-    def result(self, root):
-        return {
-            'root': root,
+    def result(self, root=None):
+        result = {
             'nodes': list(self.nodes.values()),
             'edges': self.edges,
-            'call_contexts': self.formatted_frames(self.contexts),
-            'call_stacks': self.formatted_frames(self.stacks),
+            'call_contexts': self.contexts.records,
+            'call_stacks': self.stacks.records,
         }
+        if root:
+            result['root'] = root
+        return result
+
+def write_atomic_json(path, value):
+    temporary_path = path + '.tmp'
+    with open(temporary_path, 'w') as output:
+        json.dump(value, output, separators=(',', ':'))
+    os.replace(temporary_path, path)
+
+def write_shards(records, output_path, directory, prefix):
+    shard_path = os.path.join(output_path, directory)
+    os.makedirs(shard_path, exist_ok=True)
+    shards = []
+    chunk = []
+    for record in records:
+        chunk.append(record)
+        if len(chunk) < SHARD_SIZE:
+            continue
+        shard_name = f'{prefix}-{len(shards) + 1:06d}.json'
+        write_atomic_json(os.path.join(shard_path, shard_name), chunk)
+        shards.append(os.path.join(directory, shard_name))
+        chunk = []
+    if chunk:
+        shard_name = f'{prefix}-{len(shards) + 1:06d}.json'
+        write_atomic_json(os.path.join(shard_path, shard_name), chunk)
+        shards.append(os.path.join(directory, shard_name))
+    return shards
 
 def read_jsonl(path):
     records = []
@@ -458,30 +555,10 @@ def build_program_index(functions, dataflows):
     return indexes, callers
 
 def slice_program(program, target_function, target):
-    indexes, _ = program
-    target_function_id = target_function['function']['id']
-    if target_function_id not in indexes:
-        return None
-    start = target.get('operation')
-    if not start:
-        location = target['mir_location']
-        basic_block = location['basic_block']
-        block_id = f'bb{basic_block}'
-        for block in target_function['blocks']:
-            if block['id'] != block_id:
-                continue
-            if location.get('terminator'):
-                start = block['terminator']['id']
-            else:
-                statement_index = location.get('statement_index')
-                if statement_index is not None:
-                    start = block['statements'][statement_index]['id']
-            break
-    if start not in indexes[target_function_id]['operations']:
-        return None
-
     graph = DependencyGraph(program)
-    root = graph.add_node('operation', target_function_id, start, None, (), ())
+    root = graph.add_target(target_function, target)
+    if not root:
+        return None
     graph.expand()
     return {'target': target, 'graph': graph.result(root)}
 
@@ -510,21 +587,25 @@ def analyze(cfg_path, dataflow_path, target_path, output_path):
     program = build_program_index(cfgs, dataflows)
 
     os.makedirs(output_path, exist_ok=True)
-    found = False
+
+    graph = DependencyGraph(program)
+    target_roots = []
     for target in targets:
         function = functions_by_id[target['function_id']]
-        result = slice_program(program, function, target)
-        if not result:
+        root = graph.add_target(function, target)
+        if not root:
             continue
-        target_id = target['id']
-        result_path = os.path.join(output_path, f'{target_id}.json')
-        temporary_path = result_path + '.tmp'
-        # Publish only complete target graphs
-        with open(temporary_path, 'w') as output:
-            json.dump(result, output, separators=(',', ':'))
-        os.replace(temporary_path, result_path)
-        found = True
-    return found
+        target_roots.append({'target': target, 'root': root})
+    if not target_roots:
+        return False
+
+    graph.expand()
+    write_atomic_json(os.path.join(output_path, 'targets.json'), target_roots)
+    node_shards = write_shards(graph.nodes.values(), output_path, 'nodes', 'nodes')
+    edge_shards = write_shards(graph.edges, output_path, 'edges', 'edges')
+    write_atomic_json(os.path.join(output_path, 'call-contexts.json'), graph.contexts.records)
+    write_atomic_json(os.path.join(output_path, 'call-stacks.json'), graph.stacks.records)
+    return True
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
