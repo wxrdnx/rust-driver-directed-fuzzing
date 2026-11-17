@@ -465,22 +465,17 @@ def analyze(cfg_path, dataflow_path, target_path, output_path):
     if targets is None:
         targets = target_data.get('panic_sites', [])
 
-    dataflow_by_function = {}
-    for dataflow in dataflows:
-        dataflow_by_function[dataflow['function']['id']] = dataflow
+    functions_by_id = {}
+    for function in cfgs:
+        functions_by_id[function['function']['id']] = function
     program = build_program_index(cfgs, dataflows)
 
     slices = []
     for target in targets:
-        for function in cfgs:
-            if function['function']['name'] != target['function']:
-                continue
-            function_id = function['function']['id']
-            if function_id not in dataflow_by_function:
-                continue
-            result = slice_program(program, function, target)
-            if result:
-                slices.append(result)
+        function = functions_by_id[target['function_id']]
+        result = slice_program(program, function, target)
+        if result:
+            slices.append(result)
 
     with open(output_path, 'w') as output:
         for result in slices:

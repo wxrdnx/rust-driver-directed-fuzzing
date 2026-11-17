@@ -46,6 +46,7 @@ struct PanicSite {
     id: String,
     kind: String,
     function: String,
+    function_id: String,
     span: SourceSpan,
     mir_location: MirLocation,
     condition: Option<String>,
@@ -189,10 +190,18 @@ fn analyze(tcx: TyCtxt<'_>, output_dir: &PathBuf) -> io::Result<()> {
         if tcx.def_kind(def_id).is_fn_like() {
             // Panic and calls are in the optimized MIR
             let body = tcx.optimized_mir(def_id.to_def_id());
+            let stable_function_id = function_id(tcx, def_id.to_def_id());
             // Record the CFG
             cfgs.push(mir_cfg(tcx, body, &function, def_id.to_def_id()));
             // Then, scan the MIR for panic and call sites
-            analyze_body(tcx, body, &function, &mut panic_sites, &mut calls);
+            analyze_body(
+                tcx,
+                body,
+                &function,
+                &stable_function_id,
+                &mut panic_sites,
+                &mut calls,
+            );
         }
     }
 
@@ -1050,6 +1059,7 @@ fn analysis_json(analysis: &Analysis) -> Value {
                 "id": site.id,
                 "kind": site.kind,
                 "function": site.function,
+                "function_id": site.function_id,
                 "span": {
                     "file": site.span.file,
                     "line": site.span.line,
@@ -1138,6 +1148,7 @@ fn analyze_body<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     function: &str,
+    stable_function_id: &str,
     sites: &mut Vec<PanicSite>,
     calls: &mut Vec<CallSite>,
 ) {
@@ -1156,6 +1167,7 @@ fn analyze_body<'tcx>(
                 id: String::new(),
                 kind: classify_assert(msg).into(),
                 function: function.into(),
+                function_id: stable_function_id.into(),
                 span: source_span(tcx, terminator.source_info.span),
                 mir_location: MirLocation {
                     basic_block: block.index(),
@@ -1208,6 +1220,7 @@ fn analyze_body<'tcx>(
                         id: String::new(),
                         kind: "explicit_panic".into(),
                         function: function.into(),
+                        function_id: stable_function_id.into(),
                         span: source_span(tcx, terminator.source_info.span),
                         mir_location: MirLocation {
                             basic_block: block.index(),
