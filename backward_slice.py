@@ -2,6 +2,181 @@ import argparse
 import json
 import os
 
+class DependencyGraph:
+    def __init__(self, program):
+        self.indexes, self.callers = program
+        self.nodes = {}
+        self.node_ids = {}
+        self.edges = []
+        self.edge_ids = set()
+        self.pending = []
+        self.contexts = {}
+        self.stacks = {}
+
+    def frames_id(self, records, frames, prefix):
+        if frames not in records:
+            records[frames] = f'{prefix}-{len(records) + 1}'
+        return records[frames]
+
+    def add_node(self, kind, function_id, item_id, selected_use, call_stack, call_context):
+        identity = kind, function_id, item_id, selected_use, call_stack, call_context
+        if identity in self.node_ids:
+            return self.node_ids[identity]
+        node_id = f'node-{len(self.node_ids) + 1}'
+        self.node_ids[identity] = node_id
+        self.nodes[node_id] = {
+            'id': node_id,
+            'kind': kind,
+            'function': function_id,
+            'item': item_id,
+            'selected_use': selected_use,
+            'call_stack': self.frames_id(self.stacks, call_stack, 'stack'),
+            'call_context': self.frames_id(self.contexts, call_context, 'context'),
+        }
+        self.pending.append(identity)
+        return node_id
+
+    def add_edge(self, source, target, relation, role):
+        identity = source, target, relation, role
+        if identity in self.edge_ids:
+            return
+        self.edge_ids.add(identity)
+        self.edges.append({'source': source, 'target': target, 'relation': relation, 'role': role})
+
+    def add_cutoff(self, context, frame):
+        identity = 'recursion_cutoff', context, frame
+        if identity in self.node_ids:
+            return self.node_ids[identity]
+        node_id = f'node-{len(self.node_ids) + 1}'
+        self.node_ids[identity] = node_id
+        caller, operation, callee = frame
+        self.nodes[node_id] = {
+            'id': node_id,
+            'kind': 'recursion_cutoff',
+            'call_context': self.frames_id(self.contexts, context, 'context'),
+            'frame': {'caller': caller, 'operation': operation, 'callee': callee},
+        }
+        return node_id
+
+    def expand(self):
+        while self.pending:
+            kind, function_id, item_id, selected_use, call_stack, call_context = self.pending.pop()
+            node_id = self.node_ids[(kind, function_id, item_id, selected_use, call_stack, call_context)]
+            index = self.indexes[function_id]
+            if kind == 'use':
+                sources = index['reaching'].get(item_id, [])
+                if not sources:
+                    self.nodes[node_id]['unresolved'] = True
+                for definition_id in sources:
+                    child = self.add_node('definition', function_id, definition_id, None, call_stack, call_context)
+                    self.add_edge(node_id, child, 'one_of', 'reaching_definition')
+                continue
+
+            if kind == 'definition':
+                self.expand_definition(node_id, function_id, item_id, call_stack, call_context)
+                continue
+
+            operation = index['operations'][item_id]
+            block_id = index['operation_blocks'][item_id]
+            for dependency in index['dependencies'][block_id]:
+                child = self.add_node('operation', function_id, dependency['operation'], None, call_stack, call_context)
+                self.add_edge(node_id, child, 'all_of', 'control')
+            operation_uses = operation.get('uses', [])
+            if selected_use is False:
+                operation_uses = []
+            elif selected_use is not None:
+                operation_uses = [index['uses'][selected_use]]
+            for use in operation_uses:
+                child = self.add_node('use', function_id, use['id'], None, call_stack, call_context)
+                self.add_edge(node_id, child, 'all_of', 'data')
+
+    def expand_definition(self, node_id, function_id, item_id, call_stack, call_context):
+        index = self.indexes[function_id]
+        definition = index['definitions'][item_id]
+        if definition.get('kind') == 'argument':
+            self.expand_argument(node_id, function_id, definition, call_stack, call_context)
+            return
+        defining_operation = definition.get('operation')
+        if not defining_operation:
+            self.nodes[node_id]['unresolved'] = True
+            return
+        defining = index['operations'][defining_operation]
+        if definition.get('role') == 'return_value' and defining['kind'] == 'call':
+            data = defining.get('data') or {}
+            callee_id = data.get('callee_id')
+            if callee_id in self.indexes and self.indexes[callee_id]['returns']:
+                child = self.add_node('operation', function_id, defining_operation, False, call_stack, call_context)
+                self.add_edge(node_id, child, 'all_of', 'call')
+                frame = function_id, defining_operation, callee_id
+                # TODO: Use fixed-point SCC summaries to preserve recursive dependencies instead of cutting them off
+                if frame in call_context:
+                    child = self.add_cutoff(call_context, frame)
+                    self.add_edge(node_id, child, 'one_of', 'return_value')
+                    return
+                callee_stack = call_stack + (frame,)
+                callee_context = call_context + (frame,)
+                for return_operation, return_use in self.indexes[callee_id]['returns']:
+                    child = self.add_node('operation', callee_id, return_operation, return_use, callee_stack, callee_context)
+                    self.add_edge(node_id, child, 'one_of', 'return_value')
+                return
+        child = self.add_node('operation', function_id, defining_operation, None, call_stack, call_context)
+        self.add_edge(node_id, child, 'all_of', 'definition')
+
+    def expand_argument(self, node_id, function_id, definition, call_stack, call_context):
+        argument_index = definition.get('argument_index')
+        possible_callers = self.callers.get(function_id, [])
+        matching_callers = []
+        next_stack = call_stack
+        next_context = call_context
+        matched_stack = False
+        if call_stack and call_stack[-1][2] == function_id:
+            frame = call_stack[-1]
+            for call in possible_callers:
+                if call['function'] == frame[0] and call['operation'] == frame[1]:
+                    matching_callers.append(call)
+            next_stack = call_stack[:-1]
+            next_context = call_context[:-1]
+            matched_stack = True
+        else:
+            matching_callers = possible_callers
+        mapped = False
+        for call in matching_callers:
+            caller_use = call['arguments'].get(argument_index)
+            if not caller_use:
+                continue
+            context = next_context
+            if not matched_stack:
+                frame = call['function'], call['operation'], function_id
+                if frame in call_context:
+                    child = self.add_cutoff(call_context, frame)
+                    self.add_edge(node_id, child, 'one_of', 'caller')
+                    mapped = True
+                    continue
+                context = (frame,) + call_context
+            child = self.add_node('operation', call['function'], call['operation'], caller_use, next_stack, context)
+            self.add_edge(node_id, child, 'one_of', 'caller')
+            mapped = True
+        if not mapped:
+            self.nodes[node_id]['external_input'] = True
+
+    def formatted_frames(self, records):
+        groups = []
+        for frames, group_id in records.items():
+            formatted = []
+            for frame in frames:
+                formatted.append({'caller': frame[0], 'operation': frame[1], 'callee': frame[2]})
+            groups.append({'id': group_id, 'frames': formatted})
+        return groups
+
+    def result(self, root):
+        return {
+            'root': root,
+            'nodes': list(self.nodes.values()),
+            'edges': self.edges,
+            'call_contexts': self.formatted_frames(self.contexts),
+            'call_stacks': self.formatted_frames(self.stacks),
+        }
+
 def read_jsonl(path):
     records = []
     with open(path) as file:
@@ -283,7 +458,7 @@ def build_program_index(functions, dataflows):
     return indexes, callers
 
 def slice_program(program, target_function, target):
-    indexes, callers = program
+    indexes, _ = program
     target_function_id = target_function['function']['id']
     if target_function_id not in indexes:
         return None
@@ -305,176 +480,10 @@ def slice_program(program, target_function, target):
     if start not in indexes[target_function_id]['operations']:
         return None
 
-    nodes = {}
-    node_ids = {}
-    edges = []
-    edge_ids = set()
-    pending = []
-    contexts = {}
-    stacks = {}
-
-    def frames_id(records, frames, prefix):
-        if frames not in records:
-            records[frames] = f'{prefix}-{len(records) + 1}'
-        return records[frames]
-
-    def add_node(kind, function_id, item_id, selected_use, call_stack, call_context):
-        identity = kind, function_id, item_id, selected_use, call_stack, call_context
-        if identity in node_ids:
-            return node_ids[identity]
-        node_id = f'node-{len(node_ids) + 1}'
-        node_ids[identity] = node_id
-        nodes[node_id] = {
-            'id': node_id,
-            'kind': kind,
-            'function': function_id,
-            'item': item_id,
-            'selected_use': selected_use,
-            'call_stack': frames_id(stacks, call_stack, 'stack'),
-            'call_context': frames_id(contexts, call_context, 'context'),
-        }
-        pending.append(identity)
-        return node_id
-
-    def add_edge(source, target, relation, role):
-        identity = source, target, relation, role
-        if identity in edge_ids:
-            return
-        edge_ids.add(identity)
-        edges.append({'source': source, 'target': target, 'relation': relation, 'role': role})
-
-    def add_cutoff(context, frame):
-        identity = 'recursion_cutoff', context, frame
-        if identity in node_ids:
-            return node_ids[identity]
-        node_id = f'node-{len(node_ids) + 1}'
-        node_ids[identity] = node_id
-        caller, operation, callee = frame
-        nodes[node_id] = {
-            'id': node_id,
-            'kind': 'recursion_cutoff',
-            'call_context': frames_id(contexts, context, 'context'),
-            'frame': {'caller': caller, 'operation': operation, 'callee': callee},
-        }
-        return node_id
-
-    root = add_node('operation', target_function_id, start, None, (), ())
-    while pending:
-        kind, function_id, item_id, selected_use, call_stack, call_context = pending.pop()
-        node_id = node_ids[(kind, function_id, item_id, selected_use, call_stack, call_context)]
-        index = indexes[function_id]
-        if kind == 'use':
-            sources = index['reaching'].get(item_id, [])
-            if not sources:
-                nodes[node_id]['unresolved'] = True
-            for definition_id in sources:
-                child = add_node('definition', function_id, definition_id, None, call_stack, call_context)
-                add_edge(node_id, child, 'one_of', 'reaching_definition')
-            continue
-
-        if kind == 'definition':
-            definition = index['definitions'][item_id]
-            if definition.get('kind') == 'argument':
-                argument_index = definition.get('argument_index')
-                possible_callers = callers.get(function_id, [])
-                matching_callers = []
-                next_stack = call_stack
-                next_context = call_context
-                matched_stack = False
-                if call_stack and call_stack[-1][2] == function_id:
-                    frame = call_stack[-1]
-                    for call in possible_callers:
-                        if call['function'] == frame[0] and call['operation'] == frame[1]:
-                            matching_callers.append(call)
-                    next_stack = call_stack[:-1]
-                    next_context = call_context[:-1]
-                    matched_stack = True
-                else:
-                    matching_callers = possible_callers
-                mapped = False
-                for call in matching_callers:
-                    caller_use = call['arguments'].get(argument_index)
-                    if not caller_use:
-                        continue
-                    context = next_context
-                    if not matched_stack:
-                        frame = call['function'], call['operation'], function_id
-                        if frame in call_context:
-                            child = add_cutoff(call_context, frame)
-                            add_edge(node_id, child, 'one_of', 'caller')
-                            mapped = True
-                            continue
-                        context = (frame,) + call_context
-                    child = add_node('operation', call['function'], call['operation'], caller_use, next_stack, context)
-                    add_edge(node_id, child, 'one_of', 'caller')
-                    mapped = True
-                if not mapped:
-                    nodes[node_id]['external_input'] = True
-                continue
-
-            defining_operation = definition.get('operation')
-            if not defining_operation:
-                nodes[node_id]['unresolved'] = True
-                continue
-            defining = index['operations'][defining_operation]
-            if definition.get('role') == 'return_value' and defining['kind'] == 'call':
-                data = defining.get('data') or {}
-                callee_id = data.get('callee_id')
-                if callee_id in indexes and indexes[callee_id]['returns']:
-                    child = add_node('operation', function_id, defining_operation, False, call_stack, call_context)
-                    add_edge(node_id, child, 'all_of', 'call')
-                    frame = function_id, defining_operation, callee_id
-                    # TODO: Use fixed-point SCC summaries to preserve recursive dependencies instead of cutting them off.
-                    if frame in call_context:
-                        child = add_cutoff(call_context, frame)
-                        add_edge(node_id, child, 'one_of', 'return_value')
-                        continue
-                    callee_stack = call_stack + (frame,)
-                    callee_context = call_context + (frame,)
-                    for return_operation, return_use in indexes[callee_id]['returns']:
-                        child = add_node('operation', callee_id, return_operation, return_use, callee_stack, callee_context)
-                        add_edge(node_id, child, 'one_of', 'return_value')
-                    continue
-            child = add_node('operation', function_id, defining_operation, None, call_stack, call_context)
-            add_edge(node_id, child, 'all_of', 'definition')
-            continue
-
-        operation = index['operations'][item_id]
-        block_id = index['operation_blocks'][item_id]
-        for dependency in index['dependencies'][block_id]:
-            child = add_node('operation', function_id, dependency['operation'], None, call_stack, call_context)
-            add_edge(node_id, child, 'all_of', 'control')
-        operation_uses = operation.get('uses', [])
-        if selected_use is False:
-            operation_uses = []
-        elif selected_use is not None:
-            operation_uses = [index['uses'][selected_use]]
-        for use in operation_uses:
-            child = add_node('use', function_id, use['id'], None, call_stack, call_context)
-            add_edge(node_id, child, 'all_of', 'data')
-
-    frame_groups = []
-    for frames, group_id in contexts.items():
-        formatted_frames = []
-        for frame in frames:
-            formatted_frames.append({'caller': frame[0], 'operation': frame[1], 'callee': frame[2]})
-        frame_groups.append({'id': group_id, 'frames': formatted_frames})
-    stack_groups = []
-    for frames, group_id in stacks.items():
-        formatted_frames = []
-        for frame in frames:
-            formatted_frames.append({'caller': frame[0], 'operation': frame[1], 'callee': frame[2]})
-        stack_groups.append({'id': group_id, 'frames': formatted_frames})
-    return {
-        'target': target,
-        'graph': {
-            'root': root,
-            'nodes': list(nodes.values()),
-            'edges': edges,
-            'call_contexts': frame_groups,
-            'call_stacks': stack_groups,
-        },
-    }
+    graph = DependencyGraph(program)
+    root = graph.add_node('operation', target_function_id, start, None, (), ())
+    graph.expand()
+    return {'target': target, 'graph': graph.result(root)}
 
 def slice_function(function, dataflow, target):
     program = build_program_index([function], [dataflow])
