@@ -3,7 +3,7 @@ import json
 
 # Number of recent call sites used to distinguish visited states
 CALL_CONTEXT_DEPTH = 2
-# Maximum number of call sites kept in a call stack or recorded call path
+# Maximum number of call sites kept in a recorded call path
 MAX_CALL_PATH_DEPTH = 16
 
 def read_jsonl(path):
@@ -416,7 +416,6 @@ def slice_program(program, target_function, target):
                             pending.append((function_id, defining_operation, False, call_stack, call_history))
                             frame = function_id, defining_operation, callee_id
                             callee_stack = call_stack + (frame,)
-                            callee_stack = callee_stack[-MAX_CALL_PATH_DEPTH:]
                             callee_history = extend_call_history(call_history, frame)
                             call_paths.add(callee_history)
                             for return_operation, return_use in indexes[callee_id]['returns']:
