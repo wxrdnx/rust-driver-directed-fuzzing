@@ -6,7 +6,8 @@ SHARD_SIZE = 50000
 
 class ContextTable:
     def __init__(self):
-        self.records = [{'id': 'context-0', 'parent': None, 'direction': None, 'frame': None}]
+        self.records = [None]
+        self.names = ['context-0']
         self.transitions = {}
 
     def extend(self, context_id, direction, frame):
@@ -14,55 +15,74 @@ class ContextTable:
         if transition in self.transitions:
             return self.transitions[transition]
         next_id = len(self.records)
-        caller, operation, callee = frame
         self.transitions[transition] = next_id
-        self.records.append({
-            'id': f'context-{next_id}',
-            'parent': f'context-{context_id}',
-            'direction': direction,
-            'frame': {'caller': caller, 'operation': operation, 'callee': callee},
-        })
+        self.records.append((context_id, direction, frame))
+        self.names.append(f'context-{next_id}')
         return next_id
+
+    def name(self, context_id):
+        return self.names[context_id]
 
     def contains(self, context_id, frame):
         while context_id:
-            record = self.records[context_id]
-            value = record['frame']
-            if (value['caller'], value['operation'], value['callee']) == frame:
+            parent, _, value = self.records[context_id]
+            if value == frame:
                 return True
-            context_id = int(record['parent'].removeprefix('context-'))
+            context_id = parent
         return False
+
+    def parent(self, context_id):
+        return self.records[context_id][0]
+
+    def serialized(self):
+        records = [{'id': 'context-0', 'parent': None, 'direction': None, 'frame': None}]
+        for context_id in range(1, len(self.records)):
+            parent, direction, frame = self.records[context_id]
+            caller, operation, callee = frame
+            records.append({
+                'id': f'context-{context_id}',
+                'parent': f'context-{parent}',
+                'direction': direction,
+                'frame': {'caller': caller, 'operation': operation, 'callee': callee},
+            })
+        return records
 
 class StackTable:
     def __init__(self):
-        self.records = [{'id': 'stack-0', 'parent': None, 'frame': None, 'context': None}]
+        self.records = [None]
+        self.names = ['stack-0']
         self.transitions = {}
 
-    def push(self, stack_id, frame, context_id):
-        transition = stack_id, frame, context_id
+    def push(self, stack_id, frame):
+        transition = stack_id, frame
         if transition in self.transitions:
             return self.transitions[transition]
         next_id = len(self.records)
-        caller, operation, callee = frame
         self.transitions[transition] = next_id
-        self.records.append({
-            'id': f'stack-{next_id}',
-            'parent': f'stack-{stack_id}',
-            'frame': {'caller': caller, 'operation': operation, 'callee': callee},
-            'context': f'context-{context_id}',
-        })
+        self.records.append((stack_id, frame))
+        self.names.append(f'stack-{next_id}')
         return next_id
 
+    def name(self, stack_id):
+        return self.names[stack_id]
+
     def top(self, stack_id):
-        record = self.records[stack_id]
-        frame = record['frame']
-        return frame['caller'], frame['operation'], frame['callee']
+        return self.records[stack_id][1]
 
     def pop(self, stack_id):
-        record = self.records[stack_id]
-        parent = int(record['parent'].removeprefix('stack-'))
-        context = int(record['context'].removeprefix('context-'))
-        return parent, context
+        return self.records[stack_id][0]
+
+    def serialized(self):
+        records = [{'id': 'stack-0', 'parent': None, 'frame': None}]
+        for stack_id in range(1, len(self.records)):
+            parent, frame = self.records[stack_id]
+            caller, operation, callee = frame
+            records.append({
+                'id': f'stack-{stack_id}',
+                'parent': f'stack-{parent}',
+                'frame': {'caller': caller, 'operation': operation, 'callee': callee},
+            })
+        return records
 
 class DependencyGraph:
     def __init__(self, program):
@@ -110,8 +130,8 @@ class DependencyGraph:
             'function': function_id,
             'item': item_id,
             'selected_use': selected_use,
-            'call_stack': f'stack-{call_stack}',
-            'call_context': f'context-{call_context}',
+            'call_stack': self.stacks.name(call_stack),
+            'call_context': self.contexts.name(call_context),
         }
         self.pending.append(identity)
         return node_id
@@ -133,7 +153,7 @@ class DependencyGraph:
         self.nodes[node_id] = {
             'id': node_id,
             'kind': 'recursion_cutoff',
-            'call_context': f'context-{context}',
+            'call_context': self.contexts.name(context),
             'frame': {'caller': caller, 'operation': operation, 'callee': callee},
         }
         return node_id
@@ -193,7 +213,7 @@ class DependencyGraph:
                     child = self.add_cutoff(call_context, frame)
                     self.add_edge(node_id, child, 'one_of', 'return_value')
                     return
-                callee_stack = self.stacks.push(call_stack, frame, call_context)
+                callee_stack = self.stacks.push(call_stack, frame)
                 callee_context = self.contexts.extend(call_context, 'append', frame)
                 for return_operation, return_use in self.indexes[callee_id]['returns']:
                     child = self.add_node('operation', callee_id, return_operation, return_use, callee_stack, callee_context)
@@ -214,7 +234,8 @@ class DependencyGraph:
             for call in possible_callers:
                 if call['function'] == frame[0] and call['operation'] == frame[1]:
                     matching_callers.append(call)
-            next_stack, next_context = self.stacks.pop(call_stack)
+            next_stack = self.stacks.pop(call_stack)
+            next_context = self.contexts.parent(call_context)
             matched_stack = True
         else:
             matching_callers = possible_callers
@@ -242,8 +263,8 @@ class DependencyGraph:
         result = {
             'nodes': list(self.nodes.values()),
             'edges': self.edges,
-            'call_contexts': self.contexts.records,
-            'call_stacks': self.stacks.records,
+            'call_contexts': self.contexts.serialized(),
+            'call_stacks': self.stacks.serialized(),
         }
         if root:
             result['root'] = root
@@ -587,6 +608,9 @@ def analyze(cfg_path, dataflow_path, target_path, output_path):
     program = build_program_index(cfgs, dataflows)
 
     os.makedirs(output_path, exist_ok=True)
+    manifest_path = os.path.join(output_path, 'manifest.json')
+    if os.path.exists(manifest_path):
+        os.unlink(manifest_path)
 
     graph = DependencyGraph(program)
     target_roots = []
@@ -603,8 +627,21 @@ def analyze(cfg_path, dataflow_path, target_path, output_path):
     write_atomic_json(os.path.join(output_path, 'targets.json'), target_roots)
     node_shards = write_shards(graph.nodes.values(), output_path, 'nodes', 'nodes')
     edge_shards = write_shards(graph.edges, output_path, 'edges', 'edges')
-    write_atomic_json(os.path.join(output_path, 'call-contexts.json'), graph.contexts.records)
-    write_atomic_json(os.path.join(output_path, 'call-stacks.json'), graph.stacks.records)
+    write_atomic_json(os.path.join(output_path, 'call-contexts.json'), graph.contexts.serialized())
+    write_atomic_json(os.path.join(output_path, 'call-stacks.json'), graph.stacks.serialized())
+    manifest = {
+        'complete': True,
+        'targets': 'targets.json',
+        'node_shards': node_shards,
+        'edge_shards': edge_shards,
+        'call_contexts': 'call-contexts.json',
+        'call_stacks': 'call-stacks.json',
+        'node_count': len(graph.nodes),
+        'edge_count': len(graph.edges),
+        'shard_size': SHARD_SIZE,
+    }
+    # Publish the manifest only after every graph file is complete
+    write_atomic_json(manifest_path, manifest)
     return True
 
 if __name__ == '__main__':
