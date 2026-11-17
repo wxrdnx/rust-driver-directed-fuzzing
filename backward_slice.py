@@ -1,8 +1,8 @@
 import argparse
 import json
 
-# Maximum number of call sites kept in a recorded call path
-MAX_CALL_PATH_DEPTH = 16
+# Maximum number of call sites kept in a diagnostic call history
+MAX_CALL_HISTORY_DEPTH = 16
 
 def read_jsonl(path):
     records = []
@@ -24,16 +24,18 @@ def operation_maps(function):
         operation_blocks[terminator['id']] = block['id']
     return operations, operation_blocks
 
-def extend_call_history(call_history, frame):
+def extend_call_history(call_history, history_truncated, frame):
     if not call_history:
-        return (frame,)
+        return (frame,), history_truncated
     if call_history[-1][2] == frame[0]:
         call_history = call_history + (frame,)
-        return call_history[-MAX_CALL_PATH_DEPTH:]
+        history_truncated = history_truncated or len(call_history) > MAX_CALL_HISTORY_DEPTH
+        return call_history[-MAX_CALL_HISTORY_DEPTH:], history_truncated
     if frame[2] == call_history[0][0]:
         call_history = (frame,) + call_history
-        return call_history[-MAX_CALL_PATH_DEPTH:]
-    return (frame,)
+        history_truncated = history_truncated or len(call_history) > MAX_CALL_HISTORY_DEPTH
+        return call_history[:MAX_CALL_HISTORY_DEPTH], history_truncated
+    return (frame,), True
 
 def path_state(task):
     return {
@@ -45,7 +47,7 @@ def path_state(task):
         'inputs': set(),
         'unresolved': set(),
         'conditions': {},
-        'call_paths': set(),
+        'call_histories': set(),
         'recursion_cutoffs': set(),
         'visited': set(),
     }
@@ -57,12 +59,12 @@ def copy_path(state):
     return copied
 
 def formatted_path(state):
-    call_paths = []
-    for path in sorted(state['call_paths']):
-        formatted = []
-        for caller, operation, callee in path:
-            formatted.append({'caller': caller, 'operation': operation, 'callee': callee})
-        call_paths.append(formatted)
+    call_histories = []
+    for history, truncated in sorted(state['call_histories']):
+        frames = []
+        for caller, operation, callee in history:
+            frames.append({'caller': caller, 'operation': operation, 'callee': callee})
+        call_histories.append({'frames': frames, 'truncated': truncated})
 
     recursion_cutoffs = []
     for context, frame in sorted(state['recursion_cutoffs']):
@@ -83,7 +85,7 @@ def formatted_path(state):
         'control_conditions': list(state['conditions'].values()),
         'inputs': sorted(state['inputs']),
         'unresolved': sorted(state['unresolved']),
-        'call_paths': call_paths,
+        'call_histories': call_histories,
         'recursion_cutoffs': recursion_cutoffs,
     }
 
@@ -370,7 +372,7 @@ def slice_program(program, target_function, target):
     if start not in indexes[target_function_id]['operations']:
         return None
 
-    first_task = 'operation', target_function_id, start, None, (), (), ()
+    first_task = 'operation', target_function_id, start, None, (), (), (), False
     active = [path_state(first_task)]
     completed = []
     while active:
@@ -380,7 +382,7 @@ def slice_program(program, target_function, target):
             continue
 
         task = state['pending'].pop()
-        task_kind, function_id, item_id, selected_use, call_stack, call_context, call_history = task
+        task_kind, function_id, item_id, selected_use, call_stack, call_context, call_history, history_truncated = task
         index = indexes[function_id]
         if task_kind == 'use':
             state['uses'].add(item_id)
@@ -391,7 +393,7 @@ def slice_program(program, target_function, target):
                 continue
             for definition_id in sources:
                 branch = copy_path(state)
-                branch['pending'].append(('definition', function_id, definition_id, None, call_stack, call_context, call_history))
+                branch['pending'].append(('definition', function_id, definition_id, None, call_stack, call_context, call_history, history_truncated))
                 active.append(branch)
             continue
 
@@ -423,6 +425,7 @@ def slice_program(program, target_function, target):
                         continue
                     branch = copy_path(state)
                     history = call_history
+                    truncated = history_truncated
                     context = next_context
                     if not matched_stack:
                         frame = call['function'], call['operation'], function_id
@@ -431,17 +434,17 @@ def slice_program(program, target_function, target):
                             branches.append(branch)
                             continue
                         context = (frame,) + call_context
-                        history = extend_call_history(call_history, frame)
-                    branch['pending'].append(('operation', call['function'], call['operation'], caller_use, next_stack, context, history))
+                        history, truncated = extend_call_history(call_history, history_truncated, frame)
+                    branch['pending'].append(('operation', call['function'], call['operation'], caller_use, next_stack, context, history, truncated))
                     if history:
-                        branch['call_paths'].add(history)
+                        branch['call_histories'].add((history, truncated))
                     branches.append(branch)
                 if branches:
                     active.extend(branches)
                 else:
                     state['inputs'].add(item_id)
                     if call_history:
-                        state['call_paths'].add(call_history)
+                        state['call_histories'].add((call_history, history_truncated))
                     active.append(state)
                 continue
 
@@ -454,7 +457,7 @@ def slice_program(program, target_function, target):
                 data = defining.get('data') or {}
                 callee_id = data.get('callee_id')
                 if callee_id in indexes and indexes[callee_id]['returns']:
-                    state['pending'].append(('operation', function_id, defining_operation, False, call_stack, call_context, call_history))
+                    state['pending'].append(('operation', function_id, defining_operation, False, call_stack, call_context, call_history, history_truncated))
                     frame = function_id, defining_operation, callee_id
                     # TODO: Use fixed-point SCC summaries to preserve recursive dependencies instead of cutting them off.
                     if frame in call_context:
@@ -463,14 +466,14 @@ def slice_program(program, target_function, target):
                         continue
                     callee_stack = call_stack + (frame,)
                     callee_context = call_context + (frame,)
-                    callee_history = extend_call_history(call_history, frame)
-                    state['call_paths'].add(callee_history)
+                    callee_history, callee_truncated = extend_call_history(call_history, history_truncated, frame)
+                    state['call_histories'].add((callee_history, callee_truncated))
                     for return_operation, return_use in indexes[callee_id]['returns']:
                         branch = copy_path(state)
-                        branch['pending'].append(('operation', callee_id, return_operation, return_use, callee_stack, callee_context, callee_history))
+                        branch['pending'].append(('operation', callee_id, return_operation, return_use, callee_stack, callee_context, callee_history, callee_truncated))
                         active.append(branch)
                     continue
-            state['pending'].append(('operation', function_id, defining_operation, None, call_stack, call_context, call_history))
+            state['pending'].append(('operation', function_id, defining_operation, None, call_stack, call_context, call_history, history_truncated))
             active.append(state)
             continue
 
@@ -488,7 +491,7 @@ def slice_program(program, target_function, target):
         for dependency in index['dependencies'][block_id]:
             condition_id = dependency['operation']
             state['conditions'][condition_id] = dependency
-            state['pending'].append(('operation', function_id, condition_id, None, call_stack, call_context, call_history))
+            state['pending'].append(('operation', function_id, condition_id, None, call_stack, call_context, call_history, history_truncated))
 
         operation_uses = operation.get('uses', [])
         if selected_use is False:
@@ -496,7 +499,7 @@ def slice_program(program, target_function, target):
         elif selected_use is not None:
             operation_uses = [index['uses'][selected_use]]
         for use in operation_uses:
-            state['pending'].append(('use', function_id, use['id'], None, call_stack, call_context, call_history))
+            state['pending'].append(('use', function_id, use['id'], None, call_stack, call_context, call_history, history_truncated))
         active.append(state)
 
     paths = []
