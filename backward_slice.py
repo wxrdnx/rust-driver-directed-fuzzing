@@ -35,6 +35,58 @@ def extend_call_history(call_history, frame):
         return call_history[-MAX_CALL_PATH_DEPTH:]
     return (frame,)
 
+def path_state(task):
+    return {
+        'pending': [task],
+        'functions': set(),
+        'operations': set(),
+        'definitions': set(),
+        'uses': set(),
+        'inputs': set(),
+        'unresolved': set(),
+        'conditions': {},
+        'call_paths': set(),
+        'recursion_cutoffs': set(),
+        'visited': set(),
+    }
+
+def copy_path(state):
+    copied = {}
+    for key, value in state.items():
+        copied[key] = value.copy()
+    return copied
+
+def formatted_path(state):
+    call_paths = []
+    for path in sorted(state['call_paths']):
+        formatted = []
+        for caller, operation, callee in path:
+            formatted.append({'caller': caller, 'operation': operation, 'callee': callee})
+        call_paths.append(formatted)
+
+    recursion_cutoffs = []
+    for context, frame in sorted(state['recursion_cutoffs']):
+        formatted_context = []
+        for caller, operation, callee in context:
+            formatted_context.append({'caller': caller, 'operation': operation, 'callee': callee})
+        caller, operation, callee = frame
+        recursion_cutoffs.append({
+            'context': formatted_context,
+            'frame': {'caller': caller, 'operation': operation, 'callee': callee},
+        })
+
+    return {
+        'functions': sorted(state['functions']),
+        'operations': sorted(state['operations']),
+        'definitions': sorted(state['definitions']),
+        'uses': sorted(state['uses']),
+        'control_conditions': list(state['conditions'].values()),
+        'inputs': sorted(state['inputs']),
+        'unresolved': sorted(state['unresolved']),
+        'call_paths': call_paths,
+        'recursion_cutoffs': recursion_cutoffs,
+    }
+
 # TODO: Interprocedural control dependency analysis
 
 def control_dependencies(function):
@@ -318,33 +370,125 @@ def slice_program(program, target_function, target):
     if start not in indexes[target_function_id]['operations']:
         return None
 
-    selected_functions = set()
-    selected_operations = set()
-    selected_definitions = set()
-    selected_uses = set()
-    selected_inputs = set()
-    unresolved = set()
-    conditions = {}
-    call_paths = set()
-    recursion_cutoffs = set()
-    visited = set()
-    pending = [(target_function_id, start, None, (), (), ())]
-    while pending:
-        function_id, operation_id, selected_use, call_stack, call_context, call_history = pending.pop()
-        work = function_id, operation_id, selected_use, call_stack, call_context
-        if work in visited:
+    first_task = 'operation', target_function_id, start, None, (), (), ()
+    active = [path_state(first_task)]
+    completed = []
+    while active:
+        state = active.pop()
+        if not state['pending']:
+            completed.append(state)
             continue
-        visited.add(work)
+
+        task = state['pending'].pop()
+        task_kind, function_id, item_id, selected_use, call_stack, call_context, call_history = task
         index = indexes[function_id]
-        selected_functions.add(function_id)
-        selected_operations.add(operation_id)
+        if task_kind == 'use':
+            state['uses'].add(item_id)
+            sources = index['reaching'].get(item_id, [])
+            if not sources:
+                state['unresolved'].add(item_id)
+                active.append(state)
+                continue
+            for definition_id in sources:
+                branch = copy_path(state)
+                branch['pending'].append(('definition', function_id, definition_id, None, call_stack, call_context, call_history))
+                active.append(branch)
+            continue
+
+        if task_kind == 'definition':
+            definition = index['definitions'][item_id]
+            state['definitions'].add(item_id)
+            if definition.get('kind') == 'argument':
+                argument_index = definition.get('argument_index')
+                possible_callers = callers.get(function_id, [])
+                matching_callers = []
+                next_stack = call_stack
+                next_context = call_context
+                matched_stack = False
+                if call_stack and call_stack[-1][2] == function_id:
+                    frame = call_stack[-1]
+                    for call in possible_callers:
+                        if call['function'] == frame[0] and call['operation'] == frame[1]:
+                            matching_callers.append(call)
+                    next_stack = call_stack[:-1]
+                    next_context = call_context[:-1]
+                    matched_stack = True
+                else:
+                    matching_callers = possible_callers
+
+                branches = []
+                for call in matching_callers:
+                    caller_use = call['arguments'].get(argument_index)
+                    if not caller_use:
+                        continue
+                    branch = copy_path(state)
+                    history = call_history
+                    context = next_context
+                    if not matched_stack:
+                        frame = call['function'], call['operation'], function_id
+                        if frame in call_context:
+                            branch['recursion_cutoffs'].add((call_context, frame))
+                            branches.append(branch)
+                            continue
+                        context = (frame,) + call_context
+                        history = extend_call_history(call_history, frame)
+                    branch['pending'].append(('operation', call['function'], call['operation'], caller_use, next_stack, context, history))
+                    if history:
+                        branch['call_paths'].add(history)
+                    branches.append(branch)
+                if branches:
+                    active.extend(branches)
+                else:
+                    state['inputs'].add(item_id)
+                    if call_history:
+                        state['call_paths'].add(call_history)
+                    active.append(state)
+                continue
+
+            defining_operation = definition.get('operation')
+            if not defining_operation:
+                active.append(state)
+                continue
+            defining = index['operations'][defining_operation]
+            if definition.get('role') == 'return_value' and defining['kind'] == 'call':
+                data = defining.get('data') or {}
+                callee_id = data.get('callee_id')
+                if callee_id in indexes and indexes[callee_id]['returns']:
+                    state['pending'].append(('operation', function_id, defining_operation, False, call_stack, call_context, call_history))
+                    frame = function_id, defining_operation, callee_id
+                    # TODO: Use fixed-point SCC summaries to preserve recursive dependencies instead of cutting them off.
+                    if frame in call_context:
+                        state['recursion_cutoffs'].add((call_context, frame))
+                        active.append(state)
+                        continue
+                    callee_stack = call_stack + (frame,)
+                    callee_context = call_context + (frame,)
+                    callee_history = extend_call_history(call_history, frame)
+                    state['call_paths'].add(callee_history)
+                    for return_operation, return_use in indexes[callee_id]['returns']:
+                        branch = copy_path(state)
+                        branch['pending'].append(('operation', callee_id, return_operation, return_use, callee_stack, callee_context, callee_history))
+                        active.append(branch)
+                    continue
+            state['pending'].append(('operation', function_id, defining_operation, None, call_stack, call_context, call_history))
+            active.append(state)
+            continue
+
+        operation_id = item_id
+        work = function_id, operation_id, selected_use, call_stack, call_context
+        if work in state['visited']:
+            active.append(state)
+            continue
+        state['visited'].add(work)
+        state['functions'].add(function_id)
+        state['operations'].add(operation_id)
         operation = index['operations'][operation_id]
 
         block_id = index['operation_blocks'][operation_id]
         for dependency in index['dependencies'][block_id]:
             condition_id = dependency['operation']
-            conditions[condition_id] = dependency
-            pending.append((function_id, condition_id, None, call_stack, call_context, call_history))
+            state['conditions'][condition_id] = dependency
+            state['pending'].append(('operation', function_id, condition_id, None, call_stack, call_context, call_history))
 
         operation_uses = operation.get('uses', [])
         if selected_use is False:
@@ -352,119 +496,18 @@ def slice_program(program, target_function, target):
         elif selected_use is not None:
             operation_uses = [index['uses'][selected_use]]
         for use in operation_uses:
-            use_id = use['id']
-            selected_uses.add(use_id)
-            sources = index['reaching'].get(use_id, [])
-            if not sources:
-                unresolved.add(use_id)
-            for definition_id in sources:
-                selected_definitions.add(definition_id)
-                definition = index['definitions'][definition_id]
-                if definition.get('kind') == 'argument':
-                    argument_index = definition.get('argument_index')
-                    mapped = False
-                    possible_callers = callers.get(function_id, [])
-                    matching_callers = []
-                    next_stack = call_stack
-                    next_context = call_context
-                    matched_stack = False
-                    if call_stack and call_stack[-1][2] == function_id:
-                        frame = call_stack[-1]
-                        for call in possible_callers:
-                            if call['function'] == frame[0] and call['operation'] == frame[1]:
-                                matching_callers.append(call)
-                        next_stack = call_stack[:-1]
-                        next_context = call_context[:-1]
-                        matched_stack = True
-                    else:
-                        matching_callers = possible_callers
-                    for call in matching_callers:
-                        caller_use = call['arguments'].get(argument_index)
-                        if caller_use:
-                            history = call_history
-                            context = next_context
-                            if not matched_stack:
-                                frame = call['function'], call['operation'], function_id
-                                if frame in call_context:
-                                    recursion_cutoffs.add((call_context, frame))
-                                    mapped = True
-                                    continue
-                                context = (frame,) + call_context
-                                history = extend_call_history(call_history, frame)
-                            pending.append((call['function'], call['operation'], caller_use, next_stack, context, history))
-                            if history:
-                                call_paths.add(history)
-                            mapped = True
-                    if not mapped:
-                        selected_inputs.add(definition_id)
-                        if call_history:
-                            call_paths.add(call_history)
-                    continue
-                defining_operation = definition.get('operation')
-                if defining_operation:
-                    defining = index['operations'][defining_operation]
+            state['pending'].append(('use', function_id, use['id'], None, call_stack, call_context, call_history))
+        active.append(state)
 
-                    # Interprocedural return value mapping
-
-                    # For function assignments like
-                    #     let result = calculate(num)
-                    # In this case reult is defined by the call
-                    #     result <- call calculate(num)
-                    # But in fact, the actual value comes from _0
-                    #     result <- callee _0
-                    if definition.get('role') == 'return_value' and defining['kind'] == 'call':
-                        data = defining.get('data') or {}
-                        callee_id = data.get('callee_id')
-                        if callee_id in indexes and indexes[callee_id]['returns']:
-                            pending.append((function_id, defining_operation, False, call_stack, call_context, call_history))
-                            frame = function_id, defining_operation, callee_id
-                            # TODO: Use fixed point SCC summaries instead
-                            if frame in call_context:
-                                recursion_cutoffs.add((call_context, frame))
-                                continue
-                            callee_stack = call_stack + (frame,)
-                            callee_context = call_context + (frame,)
-                            callee_history = extend_call_history(call_history, frame)
-                            call_paths.add(callee_history)
-                            for return_operation, return_use in indexes[callee_id]['returns']:
-                                pending.append((callee_id, return_operation, return_use, callee_stack, callee_context, callee_history))
-                            continue
-
-                    # For other ordinary assignments like
-                    #     let foo = bar + 1
-                    # Adds the entire assignment operation
-                    pending.append((function_id, defining_operation, None, call_stack, call_context, call_history))
-
-    formatted_paths = []
-    for path in sorted(call_paths):
-        formatted = []
-        for caller, operation, callee in path:
-            formatted.append({'caller': caller, 'operation': operation, 'callee': callee})
-        formatted_paths.append(formatted)
-
-    formatted_cutoffs = []
-    for context, frame in sorted(recursion_cutoffs):
-        formatted_context = []
-        for caller, operation, callee in context:
-            formatted_context.append({'caller': caller, 'operation': operation, 'callee': callee})
-        caller, operation, callee = frame
-        formatted_cutoffs.append({
-            'context': formatted_context,
-            'frame': {'caller': caller, 'operation': operation, 'callee': callee},
-        })
-
-    return {
-        'target': target,
-        'functions': sorted(selected_functions),
-        'operations': sorted(selected_operations),
-        'definitions': sorted(selected_definitions),
-        'uses': sorted(selected_uses),
-        'control_conditions': list(conditions.values()),
-        'inputs': sorted(selected_inputs),
-        'unresolved': sorted(unresolved),
-        'call_paths': formatted_paths,
-        'recursion_cutoffs': formatted_cutoffs,
-    }
+    paths = []
+    seen = set()
+    for state in completed:
+        path = formatted_path(state)
+        identity = json.dumps(path, sort_keys=True)
+        if identity not in seen:
+            seen.add(identity)
+            paths.append(path)
+    return {'target': target, 'paths': paths}
 
 def slice_function(function, dataflow, target):
     program = build_program_index([function], [dataflow])
