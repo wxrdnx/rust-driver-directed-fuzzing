@@ -84,6 +84,88 @@ class StackTable:
             })
         return records
 
+class FunctionSummaries:
+    def __init__(self, indexes):
+        self.indexes = indexes
+        self.cache = {}
+        self.visiting = set()
+
+    def get(self, function_id):
+        if function_id in self.cache:
+            return self.cache[function_id]
+        if function_id in self.visiting:
+            return None
+        self.visiting.add(function_id)
+        summary = self.build(function_id)
+        self.visiting.remove(function_id)
+        self.cache[function_id] = summary
+        return summary
+
+    def build(self, function_id):
+        index = self.indexes[function_id]
+        if not index['returns']:
+            return None
+        arguments = set()
+        operations = set()
+        pending = []
+        visited = set()
+        for operation_id, use_id in index['returns']:
+            pending.append(('operation', operation_id, use_id))
+        while pending:
+            kind, item_id, selected_use = pending.pop()
+            state = kind, item_id, selected_use
+            if state in visited:
+                continue
+            visited.add(state)
+            if kind == 'use':
+                sources = index['reaching'].get(item_id, [])
+                if not sources:
+                    return None
+                for definition_id in sources:
+                    pending.append(('definition', definition_id, None))
+                continue
+            if kind == 'definition':
+                definition = index['definitions'][item_id]
+                if definition.get('kind') == 'argument':
+                    arguments.add(definition.get('argument_index'))
+                    continue
+                defining_operation = definition.get('operation')
+                if not defining_operation:
+                    return None
+                defining = index['operations'][defining_operation]
+                if definition.get('role') == 'return_value' and defining['kind'] == 'call':
+                    data = defining.get('data') or {}
+                    callee_id = data.get('callee_id')
+                    if callee_id in self.indexes:
+                        callee = self.get(callee_id)
+                        if callee is None:
+                            return None
+                        operations.add(defining_operation)
+                        operations.update(callee['operations'])
+                        call_arguments = {}
+                        for use in defining.get('uses', []):
+                            role = use.get('role', '')
+                            if role.startswith('argument_'):
+                                call_arguments[int(role.removeprefix('argument_'))] = use['id']
+                        for argument_index in callee['arguments']:
+                            if argument_index not in call_arguments:
+                                return None
+                            pending.append(('use', call_arguments[argument_index], None))
+                        continue
+                pending.append(('operation', defining_operation, None))
+                continue
+            operations.add(item_id)
+            operation = index['operations'][item_id]
+            block_id = index['operation_blocks'][item_id]
+            for dependency in index['dependencies'][block_id]:
+                pending.append(('operation', dependency['operation'], None))
+            operation_uses = operation.get('uses', [])
+            if selected_use is not None:
+                operation_uses = [index['uses'][selected_use]]
+            for use in operation_uses:
+                pending.append(('use', use['id'], None))
+        return {'function': function_id, 'arguments': sorted(arguments), 'operations': sorted(operations)}
+
 class DependencyGraph:
     def __init__(self, program):
         self.indexes, self.callers = program
@@ -94,6 +176,7 @@ class DependencyGraph:
         self.pending = []
         self.contexts = ContextTable()
         self.stacks = StackTable()
+        self.summaries = FunctionSummaries(self.indexes)
 
     def add_target(self, target_function, target):
         function_id = target_function['function']['id']
@@ -158,6 +241,39 @@ class DependencyGraph:
         }
         return node_id
 
+    def add_summary(self, summary):
+        identity = 'function_summary', summary['function']
+        if identity in self.node_ids:
+            return self.node_ids[identity]
+        node_id = f'node-{len(self.node_ids) + 1}'
+        self.node_ids[identity] = node_id
+        self.nodes[node_id] = {
+            'id': node_id,
+            'kind': 'function_summary',
+            'function': summary['function'],
+            'arguments': summary['arguments'],
+            'operations': summary['operations'],
+        }
+        return node_id
+
+    def add_summary_instance(self, function_id, operation_id, callee_id, call_stack, call_context):
+        identity = 'summary_instance', function_id, operation_id, callee_id, call_stack, call_context
+        if identity in self.node_ids:
+            return self.node_ids[identity]
+        node_id = f'node-{len(self.node_ids) + 1}'
+        self.node_ids[identity] = node_id
+        self.nodes[node_id] = {
+            'id': node_id,
+            'kind': 'summary_instance',
+            'function': function_id,
+            'operation': operation_id,
+            'callee': callee_id,
+            'call_stack': self.stacks.name(call_stack),
+            'call_context': self.contexts.name(call_context),
+            'arguments': {},
+        }
+        return node_id
+
     def expand(self):
         while self.pending:
             kind, function_id, item_id, selected_use, call_stack, call_context = self.pending.pop()
@@ -207,6 +323,29 @@ class DependencyGraph:
             if callee_id in self.indexes and self.indexes[callee_id]['returns']:
                 child = self.add_node('operation', function_id, defining_operation, False, call_stack, call_context)
                 self.add_edge(node_id, child, 'all_of', 'call')
+                summary = self.summaries.get(callee_id)
+                if summary is not None:
+                    call_arguments = {}
+                    for use in defining.get('uses', []):
+                        role = use.get('role', '')
+                        if role.startswith('argument_'):
+                            call_arguments[int(role.removeprefix('argument_'))] = use['id']
+                    complete = True
+                    for argument_index in summary['arguments']:
+                        if argument_index not in call_arguments:
+                            complete = False
+                            break
+                    if complete:
+                        instance = self.add_summary_instance(function_id, defining_operation, callee_id, call_stack, call_context)
+                        summary_node = self.add_summary(summary)
+                        self.add_edge(node_id, instance, 'all_of', 'return_summary')
+                        self.add_edge(instance, summary_node, 'all_of', 'summary')
+                        for argument_index in summary['arguments']:
+                            caller_use = call_arguments[argument_index]
+                            child = self.add_node('operation', function_id, defining_operation, caller_use, call_stack, call_context)
+                            self.add_edge(instance, child, 'all_of', 'summary_argument')
+                            self.nodes[instance]['arguments'][str(argument_index)] = child
+                        return
                 frame = function_id, defining_operation, callee_id
                 # TODO: Use fixed-point SCC summaries to preserve recursive dependencies instead of cutting them off
                 if self.contexts.contains(call_context, frame):
