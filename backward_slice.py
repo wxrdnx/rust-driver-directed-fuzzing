@@ -117,7 +117,9 @@ class FunctionSummaries:
         edges = []
         edge_ids = set()
         pending = []
-        roots = []
+        root = 'summary-root'
+        nodes[root] = {'id': root, 'kind': 'return_value'}
+        return_sites = []
         callees = set()
 
         def add_node(kind, item_id, selected_use=None, expand=True):
@@ -152,7 +154,9 @@ class FunctionSummaries:
             edges.append({'source': source, 'target': target, 'relation': relation, 'role': role})
 
         for operation_id, use_id in index['returns']:
-            roots.append(add_node('operation', operation_id, use_id))
+            return_site = add_node('operation', operation_id, use_id)
+            return_sites.append(return_site)
+            add_edge(root, return_site, 'one_of', 'return_site')
         while pending:
             kind, item_id, selected_use = pending.pop()
             node_id = node_ids[(kind, item_id, selected_use)]
@@ -215,7 +219,8 @@ class FunctionSummaries:
                 add_edge(node_id, child, 'all_of', 'data')
         return {
             'function': function_id,
-            'roots': roots,
+            'root': root,
+            'return_sites': return_sites,
             'nodes': list(nodes.values()),
             'edges': edges,
             'callees': sorted(callees),
@@ -306,7 +311,8 @@ class DependencyGraph:
             'id': node_id,
             'kind': 'function_summary',
             'function': summary['function'],
-            'roots': summary['roots'],
+            'root': summary['root'],
+            'return_sites': summary['return_sites'],
             'nodes': summary['nodes'],
             'edges': summary['edges'],
         }
