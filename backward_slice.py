@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 
 def read_jsonl(path):
     records = []
@@ -499,16 +500,21 @@ def analyze(cfg_path, dataflow_path, target_path, output_path):
         functions_by_id[function['function']['id']] = function
     program = build_program_index(cfgs, dataflows)
 
+    os.makedirs(output_path, exist_ok=True)
     found = False
-    with open(output_path, 'w') as output:
-        for target in targets:
-            function = functions_by_id[target['function_id']]
-            result = slice_program(program, function, target)
-            if not result:
-                continue
+    for target in targets:
+        function = functions_by_id[target['function_id']]
+        result = slice_program(program, function, target)
+        if not result:
+            continue
+        target_id = target['id']
+        result_path = os.path.join(output_path, f'{target_id}.json')
+        temporary_path = result_path + '.tmp'
+        # Publish only complete target graphs
+        with open(temporary_path, 'w') as output:
             json.dump(result, output, separators=(',', ':'))
-            output.write('\n')
-            found = True
+        os.replace(temporary_path, result_path)
+        found = True
     return found
 
 if __name__ == '__main__':
