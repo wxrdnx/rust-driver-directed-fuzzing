@@ -101,34 +101,75 @@ class FunctionSummaries:
         self.cache[function_id] = summary
         return summary
 
+    def argument_indices(self, summary):
+        arguments = []
+        for node in summary['nodes']:
+            if node['kind'] == 'argument':
+                arguments.append(node['index'])
+        return sorted(arguments)
+
     def build(self, function_id):
         index = self.indexes[function_id]
         if not index['returns']:
             return None
-        arguments = set()
-        operations = set()
+        nodes = {}
+        node_ids = {}
+        edges = []
+        edge_ids = set()
         pending = []
-        visited = set()
+        roots = []
+        callees = set()
+
+        def add_node(kind, item_id, selected_use=None, expand=True):
+            identity = kind, item_id, selected_use
+            if identity in node_ids:
+                return node_ids[identity]
+            node_id = f'summary-node-{len(node_ids) + 1}'
+            node_ids[identity] = node_id
+            node = {'id': node_id, 'kind': kind}
+            if kind == 'operation':
+                node['operation'] = item_id
+                node['selected_use'] = selected_use
+            elif kind == 'use':
+                node['use'] = item_id
+            elif kind == 'definition':
+                node['definition'] = item_id
+            elif kind == 'argument':
+                node['index'] = item_id
+            else:
+                node['function'] = selected_use
+                node['operation'] = item_id
+            nodes[node_id] = node
+            if expand:
+                pending.append(identity)
+            return node_id
+
+        def add_edge(source, target, relation, role):
+            identity = source, target, relation, role
+            if identity in edge_ids:
+                return
+            edge_ids.add(identity)
+            edges.append({'source': source, 'target': target, 'relation': relation, 'role': role})
+
         for operation_id, use_id in index['returns']:
-            pending.append(('operation', operation_id, use_id))
+            roots.append(add_node('operation', operation_id, use_id))
         while pending:
             kind, item_id, selected_use = pending.pop()
-            state = kind, item_id, selected_use
-            if state in visited:
-                continue
-            visited.add(state)
+            node_id = node_ids[(kind, item_id, selected_use)]
             if kind == 'use':
                 sources = index['reaching'].get(item_id, [])
                 if not sources:
                     return None
                 for definition_id in sources:
-                    pending.append(('definition', definition_id, None))
+                    definition = index['definitions'][definition_id]
+                    if definition.get('kind') == 'argument':
+                        child = add_node('argument', definition.get('argument_index'), expand=False)
+                    else:
+                        child = add_node('definition', definition_id)
+                    add_edge(node_id, child, 'one_of', 'reaching_definition')
                 continue
             if kind == 'definition':
                 definition = index['definitions'][item_id]
-                if definition.get('kind') == 'argument':
-                    arguments.add(definition.get('argument_index'))
-                    continue
                 defining_operation = definition.get('operation')
                 if not defining_operation:
                     return None
@@ -140,31 +181,45 @@ class FunctionSummaries:
                         callee = self.get(callee_id)
                         if callee is None:
                             return None
-                        operations.add(defining_operation)
-                        operations.update(callee['operations'])
+                        child = add_node('operation', defining_operation, False)
+                        add_edge(node_id, child, 'all_of', 'call')
+                        nested = add_node('nested_summary', defining_operation, callee_id, False)
+                        add_edge(node_id, nested, 'all_of', 'return_summary')
+                        callees.add(callee_id)
                         call_arguments = {}
                         for use in defining.get('uses', []):
                             role = use.get('role', '')
                             if role.startswith('argument_'):
                                 call_arguments[int(role.removeprefix('argument_'))] = use['id']
-                        for argument_index in callee['arguments']:
+                        for argument_index in self.argument_indices(callee):
                             if argument_index not in call_arguments:
                                 return None
-                            pending.append(('use', call_arguments[argument_index], None))
+                            child = add_node('use', call_arguments[argument_index])
+                            add_edge(nested, child, 'all_of', 'summary_argument')
                         continue
-                pending.append(('operation', defining_operation, None))
+                child = add_node('operation', defining_operation)
+                add_edge(node_id, child, 'all_of', 'definition')
                 continue
-            operations.add(item_id)
             operation = index['operations'][item_id]
             block_id = index['operation_blocks'][item_id]
             for dependency in index['dependencies'][block_id]:
-                pending.append(('operation', dependency['operation'], None))
+                child = add_node('operation', dependency['operation'])
+                add_edge(node_id, child, 'all_of', 'control')
             operation_uses = operation.get('uses', [])
-            if selected_use is not None:
+            if selected_use is False:
+                operation_uses = []
+            elif selected_use is not None:
                 operation_uses = [index['uses'][selected_use]]
             for use in operation_uses:
-                pending.append(('use', use['id'], None))
-        return {'function': function_id, 'arguments': sorted(arguments), 'operations': sorted(operations)}
+                child = add_node('use', use['id'])
+                add_edge(node_id, child, 'all_of', 'data')
+        return {
+            'function': function_id,
+            'roots': roots,
+            'nodes': list(nodes.values()),
+            'edges': edges,
+            'callees': sorted(callees),
+        }
 
 class DependencyGraph:
     def __init__(self, program):
@@ -251,9 +306,14 @@ class DependencyGraph:
             'id': node_id,
             'kind': 'function_summary',
             'function': summary['function'],
-            'arguments': summary['arguments'],
-            'operations': summary['operations'],
+            'roots': summary['roots'],
+            'nodes': summary['nodes'],
+            'edges': summary['edges'],
         }
+        for callee_id in summary['callees']:
+            callee = self.summaries.get(callee_id)
+            if callee is not None:
+                self.add_summary(callee)
         return node_id
 
     def add_summary_instance(self, function_id, operation_id, callee_id, call_stack, call_context):
@@ -325,13 +385,14 @@ class DependencyGraph:
                 self.add_edge(node_id, child, 'all_of', 'call')
                 summary = self.summaries.get(callee_id)
                 if summary is not None:
+                    summary_arguments = self.summaries.argument_indices(summary)
                     call_arguments = {}
                     for use in defining.get('uses', []):
                         role = use.get('role', '')
                         if role.startswith('argument_'):
                             call_arguments[int(role.removeprefix('argument_'))] = use['id']
                     complete = True
-                    for argument_index in summary['arguments']:
+                    for argument_index in summary_arguments:
                         if argument_index not in call_arguments:
                             complete = False
                             break
@@ -340,7 +401,7 @@ class DependencyGraph:
                         summary_node = self.add_summary(summary)
                         self.add_edge(node_id, instance, 'all_of', 'return_summary')
                         self.add_edge(instance, summary_node, 'all_of', 'summary')
-                        for argument_index in summary['arguments']:
+                        for argument_index in summary_arguments:
                             caller_use = call_arguments[argument_index]
                             child = self.add_node('operation', function_id, defining_operation, caller_use, call_stack, call_context)
                             self.add_edge(instance, child, 'all_of', 'summary_argument')
