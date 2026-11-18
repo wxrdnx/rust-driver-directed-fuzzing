@@ -89,10 +89,71 @@ class FunctionSummaries:
         self.indexes = indexes
         self.cache = {}
         self.visiting = set()
+        self.components, self.component_by_function = self.find_components()
+        self.building_components = set()
+
+    def find_components(self):
+        calls = {}
+        for function_id, index in self.indexes.items():
+            calls[function_id] = set()
+            for operation in index['operations'].values():
+                if operation['kind'] != 'call':
+                    continue
+                data = operation.get('data') or {}
+                callee_id = data.get('callee_id')
+                if callee_id in self.indexes:
+                    calls[function_id].add(callee_id)
+        next_index = 0
+        indices = {}
+        lowlinks = {}
+        stack = []
+        on_stack = set()
+        components = []
+
+        def visit(function_id):
+            nonlocal next_index
+            indices[function_id] = next_index
+            lowlinks[function_id] = next_index
+            next_index += 1
+            stack.append(function_id)
+            on_stack.add(function_id)
+            for callee_id in calls[function_id]:
+                if callee_id not in indices:
+                    visit(callee_id)
+                    lowlinks[function_id] = min(lowlinks[function_id], lowlinks[callee_id])
+                elif callee_id in on_stack:
+                    lowlinks[function_id] = min(lowlinks[function_id], indices[callee_id])
+            if lowlinks[function_id] != indices[function_id]:
+                return
+            component = []
+            while True:
+                member = stack.pop()
+                on_stack.remove(member)
+                component.append(member)
+                if member == function_id:
+                    break
+            components.append(component)
+
+        for function_id in self.indexes:
+            if function_id not in indices:
+                visit(function_id)
+        component_by_function = {}
+        for component_id, component in enumerate(components):
+            for function_id in component:
+                component_by_function[function_id] = component_id
+        recursive = set()
+        for component_id, component in enumerate(components):
+            if len(component) > 1 or component[0] in calls[component[0]]:
+                recursive.add(component_id)
+        return {'members': components, 'recursive': recursive}, component_by_function
 
     def get(self, function_id):
         if function_id in self.cache:
             return self.cache[function_id]
+        component_id = self.component_by_function[function_id]
+        if component_id in self.components['recursive']:
+            self.build_component(component_id)
+            return self.cache.get(function_id)
         if function_id in self.visiting:
             return None
         self.visiting.add(function_id)
@@ -100,6 +161,40 @@ class FunctionSummaries:
         self.visiting.remove(function_id)
         self.cache[function_id] = summary
         return summary
+
+    def build_component(self, component_id):
+        if component_id in self.building_components:
+            return
+        self.building_components.add(component_id)
+        members = self.components['members'][component_id]
+        member_set = set(members)
+        arguments = {}
+        for function_id in members:
+            arguments[function_id] = set()
+        changed = True
+        valid = True
+        while changed and valid:
+            changed = False
+            for function_id in members:
+                summary = self.build(function_id, member_set, arguments)
+                if summary is None:
+                    valid = False
+                    break
+                found = set()
+                for node in summary['nodes']:
+                    if node['kind'] == 'argument':
+                        found.add(node['index'])
+                found.update(arguments[function_id])
+                if found != arguments[function_id]:
+                    arguments[function_id] = found
+                    changed = True
+        if valid:
+            for function_id in members:
+                self.cache[function_id] = self.build(function_id, member_set, arguments)
+        else:
+            for function_id in members:
+                self.cache[function_id] = None
+        self.building_components.remove(component_id)
 
     def argument_nodes(self, summary):
         arguments = []
@@ -109,7 +204,10 @@ class FunctionSummaries:
         arguments.sort(key=lambda node: node['index'])
         return arguments
 
-    def build(self, function_id):
+    def argument_node_id(self, argument_index):
+        return f'summary-argument-{argument_index}'
+
+    def build(self, function_id, component=None, recursive_arguments=None):
         index = self.indexes[function_id]
         if not index['returns']:
             return None
@@ -127,7 +225,10 @@ class FunctionSummaries:
             identity = kind, item_id, selected_use
             if identity in node_ids:
                 return node_ids[identity]
-            node_id = f'summary-node-{len(node_ids) + 1}'
+            if kind == 'argument':
+                node_id = self.argument_node_id(item_id)
+            else:
+                node_id = f'summary-node-{len(node_ids) + 1}'
             node_ids[identity] = node_id
             node = {'id': node_id, 'kind': kind}
             if kind == 'operation':
@@ -184,9 +285,15 @@ class FunctionSummaries:
                     data = defining.get('data') or {}
                     callee_id = data.get('callee_id')
                     if callee_id in self.indexes:
-                        callee = self.get(callee_id)
-                        if callee is None:
-                            return None
+                        if component and callee_id in component:
+                            callee_arguments = sorted(recursive_arguments[callee_id])
+                        else:
+                            callee = self.get(callee_id)
+                            if callee is None:
+                                return None
+                            callee_arguments = []
+                            for argument in self.argument_nodes(callee):
+                                callee_arguments.append(argument['index'])
                         child = add_node('operation', defining_operation, False)
                         add_edge(node_id, child, 'all_of', 'call')
                         nested = add_node('nested_summary', defining_operation, callee_id, False)
@@ -197,14 +304,13 @@ class FunctionSummaries:
                             role = use.get('role', '')
                             if role.startswith('argument_'):
                                 call_arguments[int(role.removeprefix('argument_'))] = use['id']
-                        for argument in self.argument_nodes(callee):
-                            argument_index = argument['index']
+                        for argument_index in callee_arguments:
                             if argument_index not in call_arguments:
                                 return None
                             child = add_node('use', call_arguments[argument_index])
                             add_edge(nested, child, 'all_of', 'summary_argument')
                             binding = {
-                                'summary_node': argument['id'],
+                                'summary_node': self.argument_node_id(argument_index),
                                 'index': argument_index,
                                 'target': child,
                             }
