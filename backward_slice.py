@@ -44,6 +44,14 @@ class ContextTable:
             context_id = parent
         return False
 
+    def find(self, context_id, frame):
+        while context_id:
+            parent, _, value = self.records[context_id]
+            if value == frame:
+                return context_id
+            context_id = parent
+        return None
+
     def parent(self, context_id):
         return self.records[context_id][0]
 
@@ -612,8 +620,18 @@ class DependencyGraph:
             if not matched_stack:
                 frame = call['function'], call['operation'], function_id
                 if self.contexts.contains(call_context, frame):
-                    child = self.add_cutoff(call_context, frame)
-                    self.add_edge(node_id, child, 'one_of', 'caller')
+                    component_id = self.summaries.component_by_function[function_id]
+                    caller_component = self.summaries.component_by_function[call['function']]
+                    if component_id == caller_component and component_id in self.summaries.components['recursive']:
+                        context = self.contexts.find(call_context, frame)
+                        if caller_argument['kind'] == 'use':
+                            child = self.add_node('operation', call['function'], call['operation'], caller_argument['id'], next_stack, context)
+                        else:
+                            child = self.add_constant(call['function'], call['operation'], argument_index, caller_argument['operand'], next_stack, context)
+                        self.add_edge(node_id, child, 'one_of', 'recursive_caller')
+                    else:
+                        child = self.add_cutoff(call_context, frame)
+                        self.add_edge(node_id, child, 'one_of', 'caller')
                     mapped = True
                     continue
                 context = self.contexts.extend(call_context, 'prepend', frame)
