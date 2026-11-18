@@ -703,11 +703,18 @@ fn operand_json<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, operand: &Operand<'t
     match operand {
         Operand::Copy(place) => json!({"kind": "copy", "place": place_json(tcx, body, *place)}),
         Operand::Move(place) => json!({"kind": "move", "place": place_json(tcx, body, *place)}),
-        Operand::Constant(constant) => json!({
-            "kind": "constant",
-            "type": type_json(tcx, constant.const_.ty()),
-            "value": format!("{:?}", constant.const_),
-        }),
+        Operand::Constant(constant) => {
+            let function = match constant.const_.ty().kind() {
+                ty::FnDef(def_id, _) => Some(function_id(tcx, *def_id)),
+                _ => None,
+            };
+            json!({
+                "kind": "constant",
+                "type": type_json(tcx, constant.const_.ty()),
+                "value": format!("{:?}", constant.const_),
+                "function_id": function,
+            })
+        }
         Operand::RuntimeChecks(checks) => {
             json!({"kind": "runtime_checks", "value": format!("{checks:?}")})
         }

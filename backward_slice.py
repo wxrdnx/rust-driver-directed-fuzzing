@@ -17,6 +17,65 @@ def call_arguments(operation):
             arguments[index] = {'kind': 'constant', 'operand': operand}
     return arguments
 
+def call_targets(operation):
+    data = operation.get('data') or {}
+    targets = data.get('callee_ids')
+    if targets is not None:
+        return targets
+    callee_id = data.get('callee_id')
+    if callee_id:
+        return [callee_id]
+    return []
+
+def call_callee_use(operation):
+    for use in operation.get('uses', []):
+        if use.get('role') == 'callee':
+            return use['id']
+    return False
+
+def function_ids(value):
+    found = set()
+    if isinstance(value, dict):
+        function_id = value.get('function_id')
+        if function_id:
+            found.add(function_id)
+        for nested in value.values():
+            found.update(function_ids(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            found.update(function_ids(nested))
+    return found
+
+def resolve_indirect_calls(indexes):
+    def resolve_use(index, use_id, visited):
+        if use_id in visited:
+            return set()
+        visited.add(use_id)
+        targets = set()
+        for definition_id in index['reaching'].get(use_id, []):
+            definition = index['definitions'][definition_id]
+            operation_id = definition.get('operation')
+            if not operation_id:
+                continue
+            operation = index['operations'][operation_id]
+            targets.update(function_ids(operation.get('expression')))
+            for nested_use in operation.get('uses', []):
+                targets.update(resolve_use(index, nested_use['id'], visited))
+        return targets
+
+    for index in indexes.values():
+        for operation in index['operations'].values():
+            if operation['kind'] != 'call' or call_targets(operation):
+                continue
+            callee_use = None
+            for use in operation.get('uses', []):
+                if use.get('role') == 'callee':
+                    callee_use = use['id']
+                    break
+            if callee_use:
+                data = operation.get('data') or {}
+                data['callee_ids'] = sorted(resolve_use(index, callee_use, set()))
+
 class ContextTable:
     def __init__(self):
         self.records = [None]
@@ -120,10 +179,9 @@ class FunctionSummaries:
             for operation in index['operations'].values():
                 if operation['kind'] != 'call':
                     continue
-                data = operation.get('data') or {}
-                callee_id = data.get('callee_id')
-                if callee_id in self.indexes:
-                    calls[function_id].add(callee_id)
+                for callee_id in call_targets(operation):
+                    if callee_id in self.indexes:
+                        calls[function_id].add(callee_id)
         next_index = 0
         indices = {}
         lowlinks = {}
@@ -305,9 +363,18 @@ class FunctionSummaries:
                     return None
                 defining = index['operations'][defining_operation]
                 if definition.get('role') == 'return_value' and defining['kind'] == 'call':
-                    data = defining.get('data') or {}
-                    callee_id = data.get('callee_id')
-                    if callee_id in self.indexes:
+                    targets = []
+                    for callee_id in call_targets(defining):
+                        if callee_id in self.indexes:
+                            targets.append(callee_id)
+                    if targets:
+                        child = add_node('operation', defining_operation, call_callee_use(defining))
+                        add_edge(node_id, child, 'all_of', 'call')
+                        relation = 'all_of'
+                        if len(targets) > 1:
+                            relation = 'one_of'
+                        arguments = call_arguments(defining)
+                    for callee_id in targets:
                         if component and callee_id in component:
                             callee_arguments = sorted(recursive_arguments[callee_id])
                         else:
@@ -317,12 +384,9 @@ class FunctionSummaries:
                             callee_arguments = []
                             for argument in self.argument_nodes(callee):
                                 callee_arguments.append(argument['index'])
-                        child = add_node('operation', defining_operation, False)
-                        add_edge(node_id, child, 'all_of', 'call')
                         nested = add_node('nested_summary', defining_operation, callee_id, False)
-                        add_edge(node_id, nested, 'all_of', 'return_summary')
+                        add_edge(node_id, nested, relation, 'return_summary')
                         callees.add(callee_id)
-                        arguments = call_arguments(defining)
                         for argument_index in callee_arguments:
                             if argument_index not in arguments:
                                 return None
@@ -340,6 +404,7 @@ class FunctionSummaries:
                             }
                             if binding not in nodes[nested]['argument_bindings']:
                                 nodes[nested]['argument_bindings'].append(binding)
+                    if targets:
                         continue
                 child = add_node('operation', defining_operation)
                 add_edge(node_id, child, 'all_of', 'definition')
@@ -542,25 +607,38 @@ class DependencyGraph:
             return
         defining = index['operations'][defining_operation]
         if definition.get('role') == 'return_value' and defining['kind'] == 'call':
-            data = defining.get('data') or {}
-            callee_id = data.get('callee_id')
-            if callee_id in self.indexes and self.indexes[callee_id]['returns']:
-                child = self.add_node('operation', function_id, defining_operation, False, call_stack, call_context)
+            targets = []
+            for callee_id in call_targets(defining):
+                if callee_id in self.indexes and self.indexes[callee_id]['returns']:
+                    targets.append(callee_id)
+            if targets:
+                selector = call_callee_use(defining)
+                child = self.add_node('operation', function_id, defining_operation, selector, call_stack, call_context)
                 self.add_edge(node_id, child, 'all_of', 'call')
-                summary = self.summaries.get(callee_id)
-                if summary is not None:
+                summaries = []
+                complete = True
+                arguments = call_arguments(defining)
+                for callee_id in targets:
+                    summary = self.summaries.get(callee_id)
+                    if summary is None:
+                        complete = False
+                        break
                     summary_arguments = self.summaries.argument_nodes(summary)
-                    arguments = call_arguments(defining)
-                    complete = True
                     for argument in summary_arguments:
-                        argument_index = argument['index']
-                        if argument_index not in arguments:
+                        if argument['index'] not in arguments:
                             complete = False
                             break
-                    if complete:
+                    if not complete:
+                        break
+                    summaries.append((callee_id, summary, summary_arguments))
+                if complete:
+                    relation = 'all_of'
+                    if len(summaries) > 1:
+                        relation = 'one_of'
+                    for callee_id, summary, summary_arguments in summaries:
                         instance = self.add_summary_instance(function_id, defining_operation, callee_id, call_stack, call_context)
                         summary_node = self.add_summary(summary)
-                        self.add_edge(node_id, instance, 'all_of', 'return_summary')
+                        self.add_edge(node_id, instance, relation, 'return_summary')
                         self.add_edge(instance, summary_node, 'all_of', 'summary')
                         for argument in summary_arguments:
                             argument_index = argument['index']
@@ -578,18 +656,19 @@ class DependencyGraph:
                             }
                             if binding not in self.nodes[instance]['argument_bindings']:
                                 self.nodes[instance]['argument_bindings'].append(binding)
-                        return
-                frame = function_id, defining_operation, callee_id
-                # TODO: Use fixed-point SCC summaries to preserve recursive dependencies instead of cutting them off
-                if self.contexts.contains(call_context, frame):
-                    child = self.add_cutoff(call_context, frame)
-                    self.add_edge(node_id, child, 'one_of', 'return_value')
                     return
-                callee_stack = self.stacks.push(call_stack, frame)
-                callee_context = self.contexts.extend(call_context, 'append', frame)
-                for return_operation, return_use in self.indexes[callee_id]['returns']:
-                    child = self.add_node('operation', callee_id, return_operation, return_use, callee_stack, callee_context)
-                    self.add_edge(node_id, child, 'one_of', 'return_value')
+                for callee_id in targets:
+                    frame = function_id, defining_operation, callee_id
+                    # TODO: Use fixed-point SCC summaries to preserve recursive dependencies instead of cutting them off
+                    if self.contexts.contains(call_context, frame):
+                        child = self.add_cutoff(call_context, frame)
+                        self.add_edge(node_id, child, 'one_of', 'return_value')
+                        continue
+                    callee_stack = self.stacks.push(call_stack, frame)
+                    callee_context = self.contexts.extend(call_context, 'append', frame)
+                    for return_operation, return_use in self.indexes[callee_id]['returns']:
+                        child = self.add_node('operation', callee_id, return_operation, return_use, callee_stack, callee_context)
+                        self.add_edge(node_id, child, 'one_of', 'return_value')
                 return
         child = self.add_node('operation', function_id, defining_operation, None, call_stack, call_context)
         self.add_edge(node_id, child, 'all_of', 'definition')
@@ -943,17 +1022,16 @@ def build_program_index(functions, dataflows):
             'dependencies': control_dependencies(function),
         }
 
-        for operation in operations.values():
+    resolve_indirect_calls(indexes)
+    for function_id, index in indexes.items():
+        for operation in index['operations'].values():
             if operation['kind'] != 'call':
                 continue
-            data = operation.get('data') or {}
-            callee_id = data.get('callee_id')
-            if not callee_id:
-                continue
-            if callee_id not in callers:
-                callers[callee_id] = []
             arguments = call_arguments(operation)
-            callers[callee_id].append({'function': function_id, 'operation': operation['id'], 'arguments': arguments})
+            for callee_id in call_targets(operation):
+                if callee_id not in callers:
+                    callers[callee_id] = []
+                callers[callee_id].append({'function': function_id, 'operation': operation['id'], 'arguments': arguments})
     return indexes, callers
 
 def slice_program(program, target_function, target):
