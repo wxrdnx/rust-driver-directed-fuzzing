@@ -605,8 +605,8 @@ class DependencyGraph:
             matching_callers = possible_callers
         mapped = False
         for call in matching_callers:
-            caller_use = call['arguments'].get(argument_index)
-            if not caller_use:
+            caller_argument = call['arguments'].get(argument_index)
+            if not caller_argument:
                 continue
             context = next_context
             if not matched_stack:
@@ -617,7 +617,10 @@ class DependencyGraph:
                     mapped = True
                     continue
                 context = self.contexts.extend(call_context, 'prepend', frame)
-            child = self.add_node('operation', call['function'], call['operation'], caller_use, next_stack, context)
+            if caller_argument['kind'] == 'use':
+                child = self.add_node('operation', call['function'], call['operation'], caller_argument['id'], next_stack, context)
+            else:
+                child = self.add_constant(call['function'], call['operation'], argument_index, caller_argument['operand'], next_stack, context)
             self.add_edge(node_id, child, 'one_of', 'caller')
             mapped = True
         if not mapped:
@@ -873,14 +876,14 @@ def build_program_index(functions, dataflows):
     #             'function': 'caller_a',
     #             'operation': 'caller_a:bb0:term',
     #             'arguments': {
-    #                 0: 'caller_a:bb0:term:use0',
+    #                 0: {'kind': 'use', 'id': 'caller_a:bb0:term:use0'},
     #             },
     #         },
     #         {
     #             'function': 'caller_b',
     #             'operation': 'caller_b:bb2:term',
     #             'arguments': {
-    #                 0: 'caller_b:bb2:term:use0',
+    #                 0: {'kind': 'use', 'id': 'caller_b:bb2:term:use0'},
     #             },
     #         },
     #     ]
@@ -931,11 +934,7 @@ def build_program_index(functions, dataflows):
                 continue
             if callee_id not in callers:
                 callers[callee_id] = []
-            arguments = {}
-            for use in operation.get('uses', []):
-                role = use.get('role', '')
-                if role.startswith('argument_'):
-                    arguments[int(role.removeprefix('argument_'))] = use['id']
+            arguments = call_arguments(operation)
             callers[callee_id].append({'function': function_id, 'operation': operation['id'], 'arguments': arguments})
     return indexes, callers
 
