@@ -4,6 +4,19 @@ import os
 
 SHARD_SIZE = 50000
 
+def call_arguments(operation):
+    arguments = {}
+    for use in operation.get('uses', []):
+        role = use.get('role', '')
+        if role.startswith('argument_'):
+            index = int(role.removeprefix('argument_'))
+            arguments[index] = {'kind': 'use', 'id': use['id']}
+    data = operation.get('data') or {}
+    for index, operand in enumerate(data.get('arguments', [])):
+        if index not in arguments and operand.get('kind') == 'constant':
+            arguments[index] = {'kind': 'constant', 'operand': operand}
+    return arguments
+
 class ContextTable:
     def __init__(self):
         self.records = [None]
@@ -221,7 +234,7 @@ class FunctionSummaries:
         return_sites = []
         callees = set()
 
-        def add_node(kind, item_id, selected_use=None, expand=True):
+        def add_node(kind, item_id, selected_use=None, expand=True, operand=None):
             identity = kind, item_id, selected_use
             if identity in node_ids:
                 return node_ids[identity]
@@ -240,6 +253,8 @@ class FunctionSummaries:
                 node['definition'] = item_id
             elif kind == 'argument':
                 node['index'] = item_id
+            elif kind == 'constant':
+                node['operand'] = operand
             else:
                 node['function'] = selected_use
                 node['operation'] = item_id
@@ -299,15 +314,16 @@ class FunctionSummaries:
                         nested = add_node('nested_summary', defining_operation, callee_id, False)
                         add_edge(node_id, nested, 'all_of', 'return_summary')
                         callees.add(callee_id)
-                        call_arguments = {}
-                        for use in defining.get('uses', []):
-                            role = use.get('role', '')
-                            if role.startswith('argument_'):
-                                call_arguments[int(role.removeprefix('argument_'))] = use['id']
+                        arguments = call_arguments(defining)
                         for argument_index in callee_arguments:
-                            if argument_index not in call_arguments:
+                            if argument_index not in arguments:
                                 return None
-                            child = add_node('use', call_arguments[argument_index])
+                            argument = arguments[argument_index]
+                            if argument['kind'] == 'use':
+                                child = add_node('use', argument['id'])
+                            else:
+                                constant_id = f'{defining_operation}:argument:{argument_index}'
+                                child = add_node('constant', constant_id, expand=False, operand=argument['operand'])
                             add_edge(nested, child, 'all_of', 'summary_argument')
                             binding = {
                                 'summary_node': self.argument_node_id(argument_index),
@@ -456,6 +472,24 @@ class DependencyGraph:
         }
         return node_id
 
+    def add_constant(self, function_id, operation_id, argument_index, operand, call_stack, call_context):
+        identity = 'constant', function_id, operation_id, argument_index, call_stack, call_context
+        if identity in self.node_ids:
+            return self.node_ids[identity]
+        node_id = f'node-{len(self.node_ids) + 1}'
+        self.node_ids[identity] = node_id
+        self.nodes[node_id] = {
+            'id': node_id,
+            'kind': 'constant',
+            'function': function_id,
+            'operation': operation_id,
+            'argument_index': argument_index,
+            'operand': operand,
+            'call_stack': self.stacks.name(call_stack),
+            'call_context': self.contexts.name(call_context),
+        }
+        return node_id
+
     def expand(self):
         while self.pending:
             kind, function_id, item_id, selected_use, call_stack, call_context = self.pending.pop()
@@ -508,15 +542,11 @@ class DependencyGraph:
                 summary = self.summaries.get(callee_id)
                 if summary is not None:
                     summary_arguments = self.summaries.argument_nodes(summary)
-                    call_arguments = {}
-                    for use in defining.get('uses', []):
-                        role = use.get('role', '')
-                        if role.startswith('argument_'):
-                            call_arguments[int(role.removeprefix('argument_'))] = use['id']
+                    arguments = call_arguments(defining)
                     complete = True
                     for argument in summary_arguments:
                         argument_index = argument['index']
-                        if argument_index not in call_arguments:
+                        if argument_index not in arguments:
                             complete = False
                             break
                     if complete:
@@ -526,8 +556,12 @@ class DependencyGraph:
                         self.add_edge(instance, summary_node, 'all_of', 'summary')
                         for argument in summary_arguments:
                             argument_index = argument['index']
-                            caller_use = call_arguments[argument_index]
-                            child = self.add_node('operation', function_id, defining_operation, caller_use, call_stack, call_context)
+                            caller_argument = arguments[argument_index]
+                            if caller_argument['kind'] == 'use':
+                                caller_use = caller_argument['id']
+                                child = self.add_node('operation', function_id, defining_operation, caller_use, call_stack, call_context)
+                            else:
+                                child = self.add_constant(function_id, defining_operation, argument_index, caller_argument['operand'], call_stack, call_context)
                             self.add_edge(instance, child, 'all_of', 'summary_argument')
                             binding = {
                                 'summary_node': argument['id'],
