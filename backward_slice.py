@@ -355,12 +355,16 @@ class FunctionSummaries:
                 pending.append(identity)
             return node_id
 
-        def add_edge(source, target, relation, role):
-            identity = source, target, relation, role
+        def add_edge(source, target, relation, role, control_edge=None):
+            control_edge_id = json.dumps(control_edge, sort_keys=True) if control_edge is not None else None
+            identity = source, target, relation, role, control_edge_id
             if identity in edge_ids:
                 return
             edge_ids.add(identity)
-            edges.append({'source': source, 'target': target, 'relation': relation, 'role': role})
+            edge = {'source': source, 'target': target, 'relation': relation, 'role': role}
+            if control_edge is not None:
+                edge['control_edge'] = control_edge
+            edges.append(edge)
 
         for operation_id, use_id in index['returns']:
             return_site = add_node('operation', operation_id, use_id)
@@ -443,7 +447,7 @@ class FunctionSummaries:
             block_id = index['operation_blocks'][item_id]
             for dependency in index['dependencies'][block_id]:
                 child = add_node('operation', dependency['operation'])
-                add_edge(node_id, child, 'all_of', 'control')
+                add_edge(node_id, child, 'all_of', 'control', dependency['edge'])
             operation_uses = operation.get('uses', [])
             if selected_use is False:
                 operation_uses = []
@@ -514,12 +518,16 @@ class DependencyGraph:
         self.pending.append(identity)
         return node_id
 
-    def add_edge(self, source, target, relation, role):
-        identity = source, target, relation, role
+    def add_edge(self, source, target, relation, role, control_edge=None):
+        control_edge_id = json.dumps(control_edge, sort_keys=True) if control_edge is not None else None
+        identity = source, target, relation, role, control_edge_id
         if identity in self.edge_ids:
             return
         self.edge_ids.add(identity)
-        self.edges.append({'source': source, 'target': target, 'relation': relation, 'role': role})
+        edge = {'source': source, 'target': target, 'relation': relation, 'role': role}
+        if control_edge is not None:
+            edge['control_edge'] = control_edge
+        self.edges.append(edge)
 
     def add_cutoff(self, context, frame):
         identity = 'recursion_cutoff', context, frame
@@ -615,7 +623,7 @@ class DependencyGraph:
             block_id = index['operation_blocks'][item_id]
             for dependency in index['dependencies'][block_id]:
                 child = self.add_node('operation', function_id, dependency['operation'], None, call_stack, call_context)
-                self.add_edge(node_id, child, 'all_of', 'control')
+                self.add_edge(node_id, child, 'all_of', 'control', dependency['edge'])
             operation_uses = operation.get('uses', [])
             if selected_use is False:
                 operation_uses = []
