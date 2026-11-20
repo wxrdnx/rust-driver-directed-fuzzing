@@ -19,35 +19,35 @@ def call_arguments(operation):
 
 def call_targets(operation):
     data = operation.get('data') or {}
-    targets = data.get('callee_ids')
-    if targets is not None:
-        return targets
-    callee_id = data.get('callee_id')
-    if callee_id:
-        return [callee_id]
+    # callee_ids: indirect call, multiple possible targets
+    if 'callee_ids' in data:
+        return data['callee_ids']
+    # callee_id: statically known target
+    if data.get('callee_id') is not None:
+        return [data['callee_id']]
     return []
-
-def call_callee_use(operation):
-    for use in operation.get('uses', []):
-        if use.get('role') == 'callee':
-            return use['id']
-    return False
 
 def function_ids(value):
     found = set()
+
+    # Find the function ID stored anywhere in the MIR structure
+    # This can be either a dict or list, so we do it recursively
     if isinstance(value, dict):
         function_id = value.get('function_id')
         if function_id:
             found.add(function_id)
         for nested in value.values():
-            found.update(function_ids(nested))
+            found |= function_ids(nested)
     elif isinstance(value, list):
         for nested in value:
-            found.update(function_ids(nested))
+            found |= function_ids(nested)
     return found
 
 def resolve_indirect_calls(indexes):
+    # Determines target functions of indirect calls (calls through pointerss)
+
     def resolve_use(index, use_id, visited):
+        # Traces function pointer backward to find possible function values
         if use_id in visited:
             return set()
         visited.add(use_id)
@@ -58,9 +58,9 @@ def resolve_indirect_calls(indexes):
             if not operation_id:
                 continue
             operation = index['operations'][operation_id]
-            targets.update(function_ids(operation.get('expression')))
+            targets |= function_ids(operation.get('expression'))
             for nested_use in operation.get('uses', []):
-                targets.update(resolve_use(index, nested_use['id'], visited))
+                targets |= resolve_use(index, nested_use['id'], visited)
         return targets
 
     for index in indexes.values():
@@ -77,6 +77,31 @@ def resolve_indirect_calls(indexes):
                 data['callee_ids'] = sorted(resolve_use(index, callee_use, set()))
 
 class ContextTable:
+
+    # The same function may be reached through different callers:
+    # e.g.
+    # fn update_ref(value: u32) {
+    #     check(value);
+    # }
+    # fn ioctl_a(user_value: u32) {
+    #     process.update_ref(user_value);
+    # }
+    #
+    # fn ioctl_b(default_value: u32) {
+    #     process.update_ref(default_value);
+    # }
+    #
+    # Thus
+    #      ioctl_a -> Process::update_ref
+    #      and
+    #      ioctl_b -> Process::update_ref
+    # Both reaches Process::update_ref via different paths
+    # When slicing backward from it, the analysis could combine ioctl_a and ioctl_b:
+    #      value <- ioctl_a.some_value
+    #      value <- ioctl_b.other_value
+    # They can make dependencies from different paths look like one execution
+    # With call contexts, the become different nodes:
+    #      Process::update_ref
     def __init__(self):
         self.records = [None]
         self.names = ['context-0']
@@ -263,7 +288,7 @@ class FunctionSummaries:
                 for node in summary['nodes']:
                     if node['kind'] == 'argument':
                         found.add(node['index'])
-                found.update(arguments[function_id])
+                found |= arguments[function_id]
                 if found != arguments[function_id]:
                     arguments[function_id] = found
                     changed = True
@@ -368,7 +393,12 @@ class FunctionSummaries:
                         if callee_id in self.indexes:
                             targets.append(callee_id)
                     if targets:
-                        child = add_node('operation', defining_operation, call_callee_use(defining))
+                        callee_use = False
+                        for use in defining.get('uses', []):
+                            if use.get('role') == 'callee':
+                                callee_use = use['id']
+                                break
+                        child = add_node('operation', defining_operation, callee_use)
                         add_edge(node_id, child, 'all_of', 'call')
                         relation = 'all_of'
                         if len(targets) > 1:
@@ -612,8 +642,12 @@ class DependencyGraph:
                 if callee_id in self.indexes and self.indexes[callee_id]['returns']:
                     targets.append(callee_id)
             if targets:
-                selector = call_callee_use(defining)
-                child = self.add_node('operation', function_id, defining_operation, selector, call_stack, call_context)
+                callee_use = False
+                for use in defining.get('uses', []):
+                    if use.get('role') == 'callee':
+                        callee_use = use['id']
+                        break
+                child = self.add_node('operation', function_id, defining_operation, callee_use, call_stack, call_context)
                 self.add_edge(node_id, child, 'all_of', 'call')
                 summaries = []
                 complete = True
@@ -798,6 +832,14 @@ def control_dependencies(function):
         successors[edge['source']].append(edge['target'])
 
     successors['__exit__'] = []
+    assertions_with_unwind = set()
+    for edge in function['edges']:
+        if edge['kind'] == 'unwind':
+            assertions_with_unwind.add(edge['source'])
+    for block in function['blocks']:
+        block_id = block['id']
+        if block['terminator']['kind'] == 'assert' and block_id not in assertions_with_unwind:
+            successors[block_id].append('__exit__')
     for block, targets in successors.items():
         if block != '__exit__' and not targets:
             targets.append('__exit__')
@@ -827,9 +869,9 @@ def control_dependencies(function):
             # postdominators(block) = {block} union (postdominators(successor 0) intersect ... intersect postdominators(successor n))
             common = set(successors)
             for target in targets:
-                common.intersection_update(postdominators[target])
+                common &= postdominators[target]
             result = {block}
-            result.update(common)
+            result |= common
             if result != postdominators[block]:
                 postdominators[block] = result
                 changed = True
@@ -872,8 +914,7 @@ def control_dependencies(function):
     for block in function['blocks']:
         blocks[block['id']] = block
 
-    # Examine every CFG edge and find SwitchInt
-    # Currently we only deal with control dependencies of "regular" branches
+    # Examine every CFG edge controlled by a branch or assertion
     for edge in function['edges']:
         source = edge['source']
         target = edge['target']
@@ -881,10 +922,8 @@ def control_dependencies(function):
             continue
         terminator = blocks[source]['terminator']
 
-        # Currently we only deal with control dependencies of "regular" branches
-        # e.g. match, if-else, loop, ...
-        # These all becomes SwitchInt in the MIR representation
-        if terminator['kind'] == 'switch':
+        # A switch chooses one successor, while an assertion either continues or panics
+        if terminator['kind'] in ['switch', 'assert']:
             runner = target
             stop = immediate_postdominator.get(source)
             while runner != stop and runner != '__exit__':
@@ -896,9 +935,6 @@ def control_dependencies(function):
                 if dependency not in dependencies[runner]:
                     dependencies[runner].append(dependency)
                 runner = immediate_postdominator.get(runner, '__exit__')
-        else:
-            # TODO: other kinds
-            pass
     return dependencies
 
 def build_program_index(functions, dataflows):

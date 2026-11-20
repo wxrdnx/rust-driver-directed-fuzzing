@@ -192,7 +192,7 @@ def fixed_point(function, arguments):
                 for place, definitions in state.items():
                     if place not in incoming:
                         incoming[place] = set()
-                    incoming[place].update(definitions)
+                    incoming[place] |= definitions
 
             # Update def-use state, determine which defs leave the block
             outgoing = copy_state(incoming)
@@ -219,7 +219,7 @@ def reaching_for_use(state, use):
     definitions = set()
     for current, current_definitions in state.items():
         if places_overlap(current, key):
-            definitions.update(current_definitions)
+            definitions |= current_definitions
     return definitions
 
 def resolve_uses(function, inputs):
