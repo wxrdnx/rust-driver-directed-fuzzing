@@ -37,11 +37,11 @@ CHECKED_BINARY_OPERATIONS = {
     'subwithoverflow',
 }
 
-# Integer casts and pointer-to-pointer casts are supported
-# Other casts like Transmute are treated as "opaque"
+# Preserve numeric casts, pointer casts, and bit-level transmutations
 CAST_OPERATIONS = {
     'IntToInt',
     'PtrToPtr',
+    'Transmute',
 }
 
 class ExpressionResolver:
@@ -181,9 +181,13 @@ class ExpressionResolver:
             if expression.get('cast_kind') not in CAST_OPERATIONS:
                 return self.opaque_operation(function_id, operation, 'unsupported_cast')
             operand = self.resolve_operand(function_id, operation, expression['operand'], 'operand')
+            source_type = expression['operand'].get('type')
+            if source_type is None and 'place' in expression['operand']:
+                source_type = expression['operand']['place']['type']
             return {
                 'kind': 'cast',
                 'cast_kind': expression['cast_kind'],
+                'source_type': source_type,
                 'type': expression['type'],
                 'operand': operand,
                 'status': operand['status'],
