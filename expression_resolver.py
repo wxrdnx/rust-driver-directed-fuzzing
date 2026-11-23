@@ -189,6 +189,28 @@ class ExpressionResolver:
                 'status': operand['status'],
             }
 
+        if kind == 'raw_pointer':
+            referent = None
+            for use in operation.get('uses', []):
+                if use.get('role') == 'place':
+                    referent = self.resolve_use(function_id, use['id'])
+                    break
+            if referent is None:
+                referent = {
+                    'kind': 'opaque',
+                    'operation': operation['id'],
+                    'reason': 'missing_pointer_place',
+                    'inputs': [],
+                    'status': 'partial',
+                }
+            return {
+                'kind': 'raw_pointer',
+                'mutability': expression['mutability'],
+                'place': expression['place'],
+                'referent': referent,
+                'status': referent['status'],
+            }
+
         # All other operations are treated as "opqaue"
         return self.opaque_operation(function_id, operation, 'unsupported_rvalue')
 
@@ -352,7 +374,7 @@ class ExpressionResolver:
         # Get IDs that become opaque
         if expression['kind'] == 'opaque' and expression['operation']:
             unsupported.add(expression['operation'])
-        for key in ['base', 'operand']:
+        for key in ['base', 'operand', 'referent']:
             if key in expression:
                 self.collect_unsupported(expression[key], unsupported)
         for key in ['inputs', 'operands', 'values']:
@@ -363,7 +385,7 @@ def opaque_expressions(expression):
     opaque = []
     if expression['kind'] == 'opaque':
         opaque.append(expression)
-    for key in ['base', 'operand']:
+    for key in ['base', 'operand', 'referent']:
         if key in expression:
             opaque += opaque_expressions(expression[key])
     for key in ['inputs', 'operands', 'values']:
