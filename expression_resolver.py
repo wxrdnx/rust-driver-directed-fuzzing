@@ -193,6 +193,28 @@ class ExpressionResolver:
                 'status': operand['status'],
             }
 
+        if kind == 'reference':
+            referent = None
+            for use in operation.get('uses', []):
+                if use.get('role') == 'place':
+                    referent = self.resolve_use(function_id, use['id'])
+                    break
+            if referent is None:
+                referent = {
+                    'kind': 'opaque',
+                    'operation': operation['id'],
+                    'reason': 'missing_reference_place',
+                    'inputs': [],
+                    'status': 'partial',
+                }
+            return {
+                'kind': 'reference',
+                'borrow_kind': expression['borrow_kind'],
+                'place': expression['place'],
+                'referent': referent,
+                'status': referent['status'],
+            }
+
         if kind == 'raw_pointer':
             referent = None
             for use in operation.get('uses', []):
@@ -213,6 +235,17 @@ class ExpressionResolver:
                 'place': expression['place'],
                 'referent': referent,
                 'status': referent['status'],
+            }
+
+        if kind == 'aggregate':
+            operands = []
+            for index, operand in enumerate(expression['operands']):
+                operands.append(self.resolve_operand(function_id, operation, operand, f'field_{index}'))
+            return {
+                'kind': 'aggregate',
+                'aggregate_kind': expression['aggregate_kind'],
+                'operands': operands,
+                'status': self.combined_status(operands),
             }
 
         # All other operations are treated as "opqaue"
@@ -337,6 +370,13 @@ class ExpressionResolver:
 
             else:
                 value = expression
+        elif expression['kind'] == 'aggregate' and first.get('kind') == 'field':
+            index = first.get('index')
+            if index is not None and index < len(expression['operands']):
+                value = expression['operands'][index]
+                projections = projections[1:]
+            else:
+                value = expression
         else:
             value = expression
         if not projections:
@@ -357,6 +397,7 @@ class ExpressionResolver:
         value = {
             'kind': 'opaque',
             'operation': operation['id'],
+            'operation_kind': operation['kind'],
             'reason': reason,
             'inputs': inputs,
             'status': 'partial',
@@ -435,6 +476,8 @@ def expression_impact_report(indexes, targets):
                 detail = original.get('cast_kind')
             elif reason in ['unsupported_binary_operation', 'unsupported_unary_operation']:
                 detail = original.get('operation')
+            elif reason == 'unsupported_definition':
+                detail = expression.get('operation_kind')
             else:
                 detail = original.get('kind')
 
