@@ -19,7 +19,7 @@ use rustc_middle::mir::{
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -72,6 +72,7 @@ struct CallSite {
     call_kind: String,
     callee: Option<String>,
     callee_id: Option<String>,
+    callee_instance: Option<String>,
     function_operand: String,
     arguments: Vec<String>,
     destination: String,
@@ -175,33 +176,53 @@ fn analyze(tcx: TyCtxt<'_>, output_dir: &PathBuf) -> io::Result<()> {
     let mut cfgs = Vec::new();
     let crate_name = tcx.crate_name(LOCAL_CRATE).to_string();
 
-    // HIR + MIR traversal
+    let mut pending = VecDeque::new();
+
+    // Unsafe blocks are available only for bodies owned by the current crate
     for def_id in tcx.hir_body_owners() {
         let function = tcx.def_path_str(def_id.to_def_id());
-
-        // HIR pass: collect unsafe blocks
         UnsafeBlockVisitor {
             tcx,
             function: &function,
             blocks: &mut unsafe_blocks,
         }
         .visit_body(tcx.hir_body_owned_by(def_id));
-        // MIR pass: for function-like bodies like fns, methods, and closures
         if tcx.def_kind(def_id).is_fn_like() {
-            // Panic and calls are in the optimized MIR
-            let body = tcx.optimized_mir(def_id.to_def_id());
-            let stable_function_id = function_id(tcx, def_id.to_def_id());
-            // Record the CFG
-            cfgs.push(mir_cfg(tcx, body, &function, def_id.to_def_id()));
-            // Then, scan the MIR for panic and call sites
-            analyze_body(
-                tcx,
-                body,
-                &function,
-                &stable_function_id,
-                &mut panic_sites,
-                &mut calls,
-            );
+            pending.push_back(def_id.to_def_id());
+        }
+    }
+
+    // Follow reachable calls from any crate when their MIR is available
+    let mut analyzed = HashSet::new();
+    while let Some(def_id) = pending.pop_front() {
+        if !analyzed.insert(def_id) || !tcx.is_mir_available(def_id) {
+            continue;
+        }
+        let function = tcx.def_path_str(def_id);
+        let body = tcx.optimized_mir(def_id);
+        let stable_function_id = function_id(tcx, def_id);
+        cfgs.push(mir_cfg(tcx, body, &function, def_id));
+        analyze_body(
+            tcx,
+            body,
+            &function,
+            &stable_function_id,
+            &mut panic_sites,
+            &mut calls,
+        );
+
+        // Add functions called by the current function to the worklist
+        for data in body.basic_blocks.iter() {
+            let Some(terminator) = &data.terminator else {
+                continue;
+            };
+            if let TerminatorKind::Call { func, .. } = &terminator.kind {
+                if let Some(callee) = direct_instance(tcx, body, func) {
+                    if !is_panic_sink(tcx, callee.def_id()) {
+                        pending.push_back(callee.def_id());
+                    }
+                }
+            }
         }
     }
 
@@ -552,11 +573,15 @@ fn terminator_json<'tcx>(
             target,
             ..
         } => {
-            let callee_id = direct_callee(tcx, body, func).map(|def_id| function_id(tcx, def_id));
+            let callee = direct_instance(tcx, body, func);
+            let callee_id = callee.map(|instance| function_id(tcx, instance.def_id()));
+            let callee_instance =
+                callee.map(|instance| tcx.def_path_str_with_args(instance.def_id(), instance.args));
             data = json!({
                 "callee": operand_json(tcx, body, func),
                 "callee_id": callee_id,
-                "arguments": args.iter().map(|argument| operand_json(tcx, body, &argument.node)).collect::<Vec<_>>(),
+                "callee_instance": callee_instance,
+                "arguments": args.iter().map(|argument| operand_json(tcx, body, &argument.node)).collect::<Vec<Value>>(),
                 "destination": place_json(tcx, body, *destination),
             });
             record_operand_use(
@@ -665,7 +690,7 @@ fn terminator_json<'tcx>(
 }
 
 fn place_json<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, place: Place<'tcx>) -> Value {
-    let projections = place
+    let projections: Vec<Value> = place
         .projection
         .iter()
         .map(|projection| match projection {
@@ -690,7 +715,7 @@ fn place_json<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, place: Place<'tcx>) ->
                 json!({"kind": "unwrap_unsafe_binder", "type": type_json(tcx, ty)})
             }
         })
-        .collect::<Vec<_>>();
+        .collect();
     json!({
         "kind": "place",
         "local": format!("_{}", place.local.index()),
@@ -775,7 +800,7 @@ fn rvalue_json<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, rvalue: &Rvalue<'tcx>
         Rvalue::Aggregate(kind, operands) => json!({
             "kind": "aggregate",
             "aggregate_kind": format!("{kind:?}"),
-            "operands": operands.iter().map(|operand| operand_json(tcx, body, operand)).collect::<Vec<_>>(),
+            "operands": operands.iter().map(|operand| operand_json(tcx, body, operand)).collect::<Vec<Value>>(),
         }),
         _ => json!({"kind": "unsupported", "mir_kind": format!("{rvalue:?}")}),
     }
@@ -945,11 +970,12 @@ fn propagate_panics(panic_sites: &[PanicSite], calls: &[CallSite]) -> Vec<Functi
         if call.is_panic_sink || is_known_panic_helper(callee) {
             paths
                 .entry(call.caller.clone())
-                .or_insert_with(|| vec![call.caller.clone(), callee.clone()]);
+                .or_insert(vec![call.caller.clone(), callee.clone()])
+                //.or_insert_with(|| vec![call.caller.clone(), callee.clone()]);
         }
     }
 
-    // Propagate panic reachability backward through direct calls.
+    // Propagate panic reachability backward through direct calls
     loop {
         let mut changed = false;
         for call in calls {
@@ -1109,6 +1135,7 @@ fn analysis_json(analysis: &Analysis) -> Value {
                 "call_kind": call.call_kind,
                 "callee": call.callee,
                 "callee_id": call.callee_id,
+                "callee_instance": call.callee_instance,
                 "function_operand": call.function_operand,
                 "arguments": call.arguments,
                 "destination": call.destination,
@@ -1192,10 +1219,13 @@ fn analyze_body<'tcx>(
                 unwind,
                 ..
             } => {
-                let callee = direct_callee(tcx, body, func);
-                let is_panic_sink = callee.is_some_and(|def_id| is_panic_sink(tcx, def_id));
-                let callee_id = callee.map(|def_id| function_id(tcx, def_id));
-                let callee = callee.map(|def_id| tcx.def_path_str(def_id));
+                let instance = direct_instance(tcx, body, func);
+                let is_panic_sink =
+                    instance.is_some_and(|instance| is_panic_sink(tcx, instance.def_id()));
+                let callee_id = instance.map(|instance| function_id(tcx, instance.def_id()));
+                let callee_instance = instance
+                    .map(|instance| tcx.def_path_str_with_args(instance.def_id(), instance.args));
+                let callee = instance.map(|instance| tcx.def_path_str(instance.def_id()));
                 calls.push(CallSite {
                     id: String::new(),
                     caller: function.into(),
@@ -1207,6 +1237,7 @@ fn analyze_body<'tcx>(
                     .into(),
                     callee: callee.clone(),
                     callee_id,
+                    callee_instance,
                     function_operand: format!("{func:?}"),
                     arguments: args
                         .iter()
@@ -1244,13 +1275,18 @@ fn analyze_body<'tcx>(
     }
 }
 
-fn direct_callee<'tcx>(
+fn direct_instance<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     operand: &Operand<'tcx>,
-) -> Option<rustc_span::def_id::DefId> {
+) -> Option<ty::Instance<'tcx>> {
     match operand.ty(body, tcx).kind() {
-        ty::FnDef(def_id, _) => Some(*def_id),
+        ty::FnDef(def_id, args) => {
+            ty::Instance::try_resolve(tcx, body.typing_env(tcx), *def_id, args)
+                .ok()
+                .flatten()
+                .or_else(|| Some(ty::Instance::new_raw(*def_id, args)))
+        }
         _ => None,
     }
 }
