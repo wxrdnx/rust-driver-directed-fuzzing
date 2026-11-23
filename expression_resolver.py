@@ -49,6 +49,7 @@ class ExpressionResolver:
         self.indexes = indexes
         self.cache = {}
         self.visiting = set()
+        self.argument_bindings = {}
 
     def result(self, function_id, use_id):
         expression = self.resolve_use(function_id, use_id)
@@ -60,8 +61,8 @@ class ExpressionResolver:
             'unsupported_operations': sorted(unsupported),
         }
 
-    def resolve_use(self, function_id, use_id):
-        key = function_id, use_id
+    def resolve_use(self, function_id, use_id, context=()):
+        key = function_id, use_id, context
         if key in self.cache:
             return self.cache[key]
         if key in self.visiting:
@@ -75,7 +76,7 @@ class ExpressionResolver:
         values = []
         for definition_id in index['reaching'].get(use_id, []):
             # Resolve the expression that produced this definition
-            value = self.resolve_definition(function_id, definition_id)
+            value = self.resolve_definition(function_id, definition_id, context)
             # Select the part of the defined value read by this use
             # For example, if the definition is (result, overflow) and the use reads .1, select overflow
             value = self.apply_projection(value, index['definitions'][definition_id], use)
@@ -109,10 +110,13 @@ class ExpressionResolver:
 
         return expression
 
-    def resolve_definition(self, function_id, definition_id):
+    def resolve_definition(self, function_id, definition_id, context):
         index = self.indexes[function_id]
         definition = index['definitions'][definition_id]
         if definition.get('kind') == 'argument':
+            binding = self.argument_bindings.get((context, function_id, definition.get('argument_index')))
+            if binding is not None:
+                return binding
             return {
                 'kind': 'argument',
                 'function': function_id,
@@ -132,27 +136,97 @@ class ExpressionResolver:
             }
 
         operation = index['operations'][operation_id]
+        if operation['kind'] == 'call':
+            return self.resolve_call(function_id, operation, context)
         # Only assignments with "structured expressions" can be resolved into values
         # Otherwise, treat the assignment as "opaque"
         if operation['kind'] != 'assignment' or 'expression' not in operation:
-            return self.opaque_operation(function_id, operation, 'unsupported_definition')
-        return self.resolve_expression(function_id, operation)
+            return self.opaque_operation(function_id, operation, 'unsupported_definition', context)
+        return self.resolve_expression(function_id, operation, context)
 
-    def resolve_expression(self, function_id, operation):
+    def resolve_call(self, function_id, operation, context):
+        data = operation.get('data') or {}
+        callee_ids = data.get('callee_ids')
+        if callee_ids is None and data.get('callee_id') is not None:
+            callee_ids = [data['callee_id']]
+        if not callee_ids:
+            return self.opaque_operation(function_id, operation, 'unresolved_call', context)
+        arguments = {}
+        for index, operand in enumerate(data.get('arguments', [])):
+            arguments[index] = self.resolve_operand(function_id, operation, operand, f'argument_{index}', context)
+        values = []
+        for callee_id in callee_ids:
+            if callee_id not in self.indexes:
+                values.append({
+                    'kind': 'opaque',
+                    'operation': operation['id'],
+                    'operation_kind': 'call',
+                    'reason': 'unavailable_callee',
+                    'callee_id': callee_id,
+                    'inputs': list(arguments.values()),
+                    'status': 'partial',
+                })
+                continue
+            if not self.indexes[callee_id]['returns']:
+                values.append({
+                    'kind': 'opaque',
+                    'operation': operation['id'],
+                    'operation_kind': 'call',
+                    'reason': 'missing_callee_return',
+                    'callee_id': callee_id,
+                    'inputs': list(arguments.values()),
+                    'status': 'partial',
+                })
+                continue
+            recursive = callee_id == function_id
+            for caller, _, callee in context:
+                if callee_id == caller or callee_id == callee:
+                    recursive = True
+                    break
+            if recursive:
+                values.append({
+                    'kind': 'opaque',
+                    'operation': operation['id'],
+                    'operation_kind': 'call',
+                    'reason': 'recursive_call',
+                    'inputs': list(arguments.values()),
+                    'status': 'partial',
+                })
+                continue
+            frame = function_id, operation['id'], callee_id
+            callee_context = context + (frame,)
+            for index, argument in arguments.items():
+                self.argument_bindings[(callee_context, callee_id, index)] = argument
+            for _, use_id in self.indexes[callee_id]['returns']:
+                values.append(self.resolve_use(callee_id, use_id, callee_context))
+        if not values:
+            return self.opaque_operation(function_id, operation, 'unresolved_call_return', context)
+        unique_values = []
+        seen = set()
+        for value in values:
+            identity = json.dumps(value, sort_keys=True, separators=(',', ':'))
+            if identity not in seen:
+                seen.add(identity)
+                unique_values.append(value)
+        if len(unique_values) == 1:
+            return unique_values[0]
+        return {'kind': 'one_of', 'values': unique_values, 'status': self.combined_status(unique_values)}
+
+    def resolve_expression(self, function_id, operation, context):
         expression = operation['expression']
         kind = expression.get('kind')
 
         if kind == 'use':
-            return self.resolve_operand(function_id, operation, expression['operand'], 'operand')
+            return self.resolve_operand(function_id, operation, expression['operand'], 'operand', context)
 
         # Binary operations
         if kind in ['binary', 'checked_binary']:
             supported_operations = BINARY_OPERATIONS if kind == 'binary' else CHECKED_BINARY_OPERATIONS
             if expression.get('operation') not in supported_operations:
-                return self.opaque_operation(function_id, operation, 'unsupported_binary_operation')
+                return self.opaque_operation(function_id, operation, 'unsupported_binary_operation', context)
 
-            left = self.resolve_operand(function_id, operation, expression['operands'][0], 'left_operand')
-            right = self.resolve_operand(function_id, operation, expression['operands'][1], 'right_operand')
+            left = self.resolve_operand(function_id, operation, expression['operands'][0], 'left_operand', context)
+            right = self.resolve_operand(function_id, operation, expression['operands'][1], 'right_operand', context)
             operands = [left, right]
             return {
                 'kind': kind,
@@ -166,8 +240,8 @@ class ExpressionResolver:
         # Unary Operations
         if kind == 'unary':
             if expression.get('operation') not in UNARY_OPERATIONS:
-                return self.opaque_operation(function_id, operation, 'unsupported_unary_operation')
-            operand = self.resolve_operand(function_id, operation, expression['operand'], 'operand')
+                return self.opaque_operation(function_id, operation, 'unsupported_unary_operation', context)
+            operand = self.resolve_operand(function_id, operation, expression['operand'], 'operand', context)
             return {
                 'kind': 'unary',
                 'operation': expression['operation'],
@@ -179,8 +253,8 @@ class ExpressionResolver:
         # Only integer to integer casting is supported
         if kind == 'cast':
             if expression.get('cast_kind') not in CAST_OPERATIONS:
-                return self.opaque_operation(function_id, operation, 'unsupported_cast')
-            operand = self.resolve_operand(function_id, operation, expression['operand'], 'operand')
+                return self.opaque_operation(function_id, operation, 'unsupported_cast', context)
+            operand = self.resolve_operand(function_id, operation, expression['operand'], 'operand', context)
             source_type = expression['operand'].get('type')
             if source_type is None and 'place' in expression['operand']:
                 source_type = expression['operand']['place']['type']
@@ -197,7 +271,7 @@ class ExpressionResolver:
             referent = None
             for use in operation.get('uses', []):
                 if use.get('role') == 'place':
-                    referent = self.resolve_use(function_id, use['id'])
+                    referent = self.resolve_use(function_id, use['id'], context)
                     break
             if referent is None:
                 referent = {
@@ -219,7 +293,7 @@ class ExpressionResolver:
             referent = None
             for use in operation.get('uses', []):
                 if use.get('role') == 'place':
-                    referent = self.resolve_use(function_id, use['id'])
+                    referent = self.resolve_use(function_id, use['id'], context)
                     break
             if referent is None:
                 referent = {
@@ -240,7 +314,7 @@ class ExpressionResolver:
         if kind == 'aggregate':
             operands = []
             for index, operand in enumerate(expression['operands']):
-                operands.append(self.resolve_operand(function_id, operation, operand, f'field_{index}'))
+                operands.append(self.resolve_operand(function_id, operation, operand, f'field_{index}', context))
             return {
                 'kind': 'aggregate',
                 'aggregate_kind': expression['aggregate_kind'],
@@ -249,9 +323,9 @@ class ExpressionResolver:
             }
 
         # All other operations are treated as "opqaue"
-        return self.opaque_operation(function_id, operation, 'unsupported_rvalue')
+        return self.opaque_operation(function_id, operation, 'unsupported_rvalue', context)
 
-    def resolve_operand(self, function_id, operation, operand, role):
+    def resolve_operand(self, function_id, operation, operand, role, context):
         # constant: which are, you know, constants
         if operand['kind'] == 'constant':
             value = {
@@ -277,7 +351,7 @@ class ExpressionResolver:
         # move and copy: follow the use to obtain the read value
         for use in operation.get('uses', []):
             if use.get('role') == role:
-                return self.resolve_use(function_id, use['id'])
+                return self.resolve_use(function_id, use['id'], context)
 
         # Reach here when no use has the corresponding role
         # This shouldn't happen assuming that the analyzer output is complete
@@ -390,10 +464,10 @@ class ExpressionResolver:
             'status': value['status'],
         }
 
-    def opaque_operation(self, function_id, operation, reason):
+    def opaque_operation(self, function_id, operation, reason, context):
         inputs = []
         for use in operation.get('uses', []):
-            inputs.append(self.resolve_use(function_id, use['id']))
+            inputs.append(self.resolve_use(function_id, use['id'], context))
         value = {
             'kind': 'opaque',
             'operation': operation['id'],
@@ -476,7 +550,8 @@ def expression_impact_report(indexes, targets):
                 detail = original.get('cast_kind')
             elif reason in ['unsupported_binary_operation', 'unsupported_unary_operation']:
                 detail = original.get('operation')
-            elif reason == 'unsupported_definition':
+            elif reason in ['unsupported_definition', 'unresolved_call', 'unresolved_call_return',
+                            'unavailable_callee', 'missing_callee_return', 'recursive_call']:
                 detail = expression.get('operation_kind')
             else:
                 detail = original.get('kind')
