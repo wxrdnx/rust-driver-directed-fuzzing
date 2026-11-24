@@ -729,14 +729,53 @@ fn operand_json<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, operand: &Operand<'t
         Operand::Copy(place) => json!({"kind": "copy", "place": place_json(tcx, body, *place)}),
         Operand::Move(place) => json!({"kind": "move", "place": place_json(tcx, body, *place)}),
         Operand::Constant(constant) => {
-            let function = match constant.const_.ty().kind() {
+            let ty = constant.const_.ty();
+            let function = match ty.kind() {
                 ty::FnDef(def_id, _) => Some(function_id(tcx, *def_id)),
                 _ => None,
             };
+            let scalar = match ty.kind() {
+                ty::Bool | ty::Int(_) | ty::Uint(_) => {
+                    constant.const_.try_to_scalar_int().or_else(|| {
+                        constant
+                            .const_
+                            .eval(tcx, body.typing_env(tcx), constant.span)
+                            .ok()
+                            .and_then(|value| value.try_to_scalar_int())
+                    })
+                }
+                _ => None,
+            };
+            let value = match ty.kind() {
+                ty::Bool => match scalar.and_then(|value| value.try_to_bool().ok()) {
+                    Some(value) => json!({"kind": "boolean", "value": value}),
+                    None => json!({"kind": "opaque"}),
+                },
+                ty::Int(_) => match scalar {
+                    Some(value) => json!({
+                        "kind": "integer",
+                        "bits": value.size().bits(),
+                        "signed": true,
+                        "value": value.to_int(value.size()).to_string(),
+                    }),
+                    None => json!({"kind": "opaque"}),
+                },
+                ty::Uint(_) => match scalar {
+                    Some(value) => json!({
+                        "kind": "integer",
+                        "bits": value.size().bits(),
+                        "signed": false,
+                        "value": value.to_uint(value.size()).to_string(),
+                    }),
+                    None => json!({"kind": "opaque"}),
+                },
+                _ => json!({"kind": "opaque"}),
+            };
             json!({
                 "kind": "constant",
-                "type": type_json(tcx, constant.const_.ty()),
-                "value": format!("{:?}", constant.const_),
+                "type": type_json(tcx, ty),
+                "value": value,
+                "debug": format!("{:?}", constant.const_),
                 "function_id": function,
             })
         }
@@ -970,8 +1009,7 @@ fn propagate_panics(panic_sites: &[PanicSite], calls: &[CallSite]) -> Vec<Functi
         if call.is_panic_sink || is_known_panic_helper(callee) {
             paths
                 .entry(call.caller.clone())
-                .or_insert(vec![call.caller.clone(), callee.clone()])
-                //.or_insert_with(|| vec![call.caller.clone(), callee.clone()]);
+                .or_insert(vec![call.caller.clone(), callee.clone()]);
         }
     }
 
