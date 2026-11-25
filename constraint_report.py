@@ -25,15 +25,15 @@ def analyze(cfg_path, dataflow_path, target_path, output_path):
             operation_id = f'{function_id}:bb{block}:term'
             operation = indexes[function_id]['operations'].get(operation_id)
             if operation:
-                for use in operation.get('uses', []):
-                    if use.get('role') == 'condition':
+                for use in operation['uses']:
+                    if use['role'] == 'condition':
                         use_id = use['id']
                         break
         if use_id is None:
             counts['skipped'] += 1
             continue
         resolved = resolver.result(function_id, use_id)
-        constraint = ConstraintBuilder().assertion(resolved, target.get('expected'))
+        constraint = ConstraintBuilder().assertion(resolved, target['expected'])
         counts[constraint['status']] += 1
         records.append({'target': target, 'constraint': constraint})
     report = {

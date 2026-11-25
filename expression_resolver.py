@@ -114,26 +114,18 @@ class ExpressionResolver:
         index = self.indexes[function_id]
         definition = index['definitions'][definition_id]
         if definition.get('kind') == 'argument':
-            binding = self.argument_bindings.get((context, function_id, definition.get('argument_index')))
+            binding = self.argument_bindings.get((context, function_id, definition['argument_index']))
             if binding is not None:
                 return binding
             return {
                 'kind': 'argument',
                 'function': function_id,
-                'index': definition.get('argument_index'),
+                'index': definition['argument_index'],
                 'place': definition['place'],
                 'status': 'complete',
             }
 
-        operation_id = definition.get('operation')
-        if not operation_id:
-            return {
-                'kind': 'opaque',
-                'operation': None,
-                'reason': 'missing_defining_operation',
-                'inputs': [],
-                'status': 'partial',
-            }
+        operation_id = definition['operation']
 
         operation = index['operations'][operation_id]
         if operation['kind'] == 'call':
@@ -145,14 +137,14 @@ class ExpressionResolver:
         return self.resolve_expression(function_id, operation, context)
 
     def resolve_call(self, function_id, operation, context):
-        data = operation.get('data') or {}
+        data = operation['data']
         callee_ids = data.get('callee_ids')
         if callee_ids is None and data.get('callee_id') is not None:
             callee_ids = [data['callee_id']]
         if not callee_ids:
             return self.opaque_operation(function_id, operation, 'unresolved_call', context)
         arguments = {}
-        for index, operand in enumerate(data.get('arguments', [])):
+        for index, operand in enumerate(data['arguments']):
             arguments[index] = self.resolve_operand(function_id, operation, operand, f'argument_{index}', context)
         values = []
         for callee_id in callee_ids:
@@ -214,7 +206,7 @@ class ExpressionResolver:
 
     def resolve_expression(self, function_id, operation, context):
         expression = operation['expression']
-        kind = expression.get('kind')
+        kind = expression['kind']
 
         if kind == 'use':
             return self.resolve_operand(function_id, operation, expression['operand'], 'operand', context)
@@ -222,7 +214,7 @@ class ExpressionResolver:
         # Binary operations
         if kind in ['binary', 'checked_binary']:
             supported_operations = BINARY_OPERATIONS if kind == 'binary' else CHECKED_BINARY_OPERATIONS
-            if expression.get('operation') not in supported_operations:
+            if expression['operation'] not in supported_operations:
                 return self.opaque_operation(function_id, operation, 'unsupported_binary_operation', context)
 
             left = self.resolve_operand(function_id, operation, expression['operands'][0], 'left_operand', context)
@@ -232,14 +224,14 @@ class ExpressionResolver:
                 'kind': kind,
                 'operation': expression['operation'],
                 'operands': operands,
-                'result_projection': expression.get('result_projection'),
-                'overflow_projection': expression.get('overflow_projection'),
+                'result_projection': expression['result_projection'],
+                'overflow_projection': expression['overflow_projection'],
                 'status': self.combined_status(operands),
             }
 
         # Unary Operations
         if kind == 'unary':
-            if expression.get('operation') not in UNARY_OPERATIONS:
+            if expression['operation'] not in UNARY_OPERATIONS:
                 return self.opaque_operation(function_id, operation, 'unsupported_unary_operation', context)
             operand = self.resolve_operand(function_id, operation, expression['operand'], 'operand', context)
             return {
@@ -252,7 +244,7 @@ class ExpressionResolver:
         # Type Casting
         # Only integer to integer casting is supported
         if kind == 'cast':
-            if expression.get('cast_kind') not in CAST_OPERATIONS:
+            if expression['cast_kind'] not in CAST_OPERATIONS:
                 return self.opaque_operation(function_id, operation, 'unsupported_cast', context)
             operand = self.resolve_operand(function_id, operation, expression['operand'], 'operand', context)
             source_type = expression['operand'].get('type')
@@ -270,7 +262,7 @@ class ExpressionResolver:
         if kind == 'reference':
             referent = None
             for use in operation.get('uses', []):
-                if use.get('role') == 'place':
+                if use['role'] == 'place':
                     referent = self.resolve_use(function_id, use['id'], context)
                     break
             if referent is None:
@@ -292,7 +284,7 @@ class ExpressionResolver:
         if kind == 'raw_pointer':
             referent = None
             for use in operation.get('uses', []):
-                if use.get('role') == 'place':
+                if use['role'] == 'place':
                     referent = self.resolve_use(function_id, use['id'], context)
                     break
             if referent is None:
@@ -350,7 +342,7 @@ class ExpressionResolver:
 
         # move and copy: follow the use to obtain the read value
         for use in operation.get('uses', []):
-            if use.get('role') == role:
+            if use['role'] == role:
                 return self.resolve_use(function_id, use['id'], context)
 
         # Reach here when no use has the corresponding role
@@ -423,8 +415,8 @@ class ExpressionResolver:
         # use: expression.1
         # The selected value is overflow
         first = projections[0]
-        if expression['kind'] == 'checked_binary' and first.get('kind') == 'field':
-            if first.get('index') == expression['result_projection']:
+        if expression['kind'] == 'checked_binary' and first['kind'] == 'field':
+            if first['index'] == expression['result_projection']:
                 value = {
                     'kind': 'checked_result',
                     'operation': expression['operation'],
@@ -433,7 +425,7 @@ class ExpressionResolver:
                 }
                 projections = projections[1:]
 
-            elif first.get('index') == expression['overflow_projection']:
+            elif first['index'] == expression['overflow_projection']:
                 value = {
                     'kind': 'overflow',
                     'operation': expression['operation'],
@@ -444,8 +436,8 @@ class ExpressionResolver:
 
             else:
                 value = expression
-        elif expression['kind'] == 'aggregate' and first.get('kind') == 'field':
-            index = first.get('index')
+        elif expression['kind'] == 'aggregate' and first['kind'] == 'field':
+            index = first['index']
             if index is not None and index < len(expression['operands']):
                 value = expression['operands'][index]
                 projections = projections[1:]
@@ -529,8 +521,8 @@ def expression_impact_report(indexes, targets):
             operation_id = f'{function_id}:bb{block}:term'
             operation = indexes[function_id]['operations'].get(operation_id)
             if operation:
-                for use in operation.get('uses', []):
-                    if use.get('role') == 'condition':
+                for use in operation['uses']:
+                    if use['role'] == 'condition':
                         use_id = use['id']
                         break
         # Skip if there is no condition use

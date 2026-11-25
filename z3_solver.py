@@ -32,6 +32,8 @@ class Z3Translator:
             return self.overflow(expression)
         if kind == 'one_of':
             return self.one_of(expression)
+        if kind == 'projection':
+            return self.projection(expression)
         if kind == 'assertion':
             condition = self.translate(expression['condition'])
             if condition is None:
@@ -68,6 +70,23 @@ class Z3Translator:
             self.error = f'unsupported variable type: {var_type}'
             return None
 
+        self.variables[name] = variable
+        self.variable_types[name] = value_type
+        return variable
+
+    def projection(self, expression):
+        name = expression['name']
+        if name in self.variables:
+            return self.variables[name]
+        value_type = expression['type']
+        if value_type['kind'] == 'boolean':
+            variable = z3.Bool(name)
+        elif value_type['kind'] == 'bitvector':
+            variable = z3.BitVec(name, value_type['bits'])
+        else:
+            type_kind = value_type['kind']
+            self.error = f'unsupported projection type: {type_kind}'
+            return None
         self.variables[name] = variable
         self.variable_types[name] = value_type
         return variable

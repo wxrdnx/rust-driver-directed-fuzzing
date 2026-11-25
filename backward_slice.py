@@ -7,18 +7,18 @@ SHARD_SIZE = 50000
 def call_arguments(operation):
     arguments = {}
     for use in operation.get('uses', []):
-        role = use.get('role', '')
+        role = use['role']
         if role.startswith('argument_'):
             index = int(role.removeprefix('argument_'))
             arguments[index] = {'kind': 'use', 'id': use['id']}
-    data = operation.get('data') or {}
-    for index, operand in enumerate(data.get('arguments', [])):
-        if index not in arguments and operand.get('kind') == 'constant':
+    data = operation['data']
+    for index, operand in enumerate(data['arguments']):
+        if index not in arguments and operand['kind'] == 'constant':
             arguments[index] = {'kind': 'constant', 'operand': operand}
     return arguments
 
 def call_targets(operation):
-    data = operation.get('data') or {}
+    data = operation['data']
     # callee_ids: indirect call, multiple possible targets
     if 'callee_ids' in data:
         return data['callee_ids']
@@ -69,11 +69,11 @@ def resolve_indirect_calls(indexes):
                 continue
             callee_use = None
             for use in operation.get('uses', []):
-                if use.get('role') == 'callee':
+                if use['role'] == 'callee':
                     callee_use = use['id']
                     break
             if callee_use:
-                data = operation.get('data') or {}
+                data = operation['data']
                 data['callee_ids'] = sorted(resolve_use(index, callee_use, set()))
 
 class ContextTable:
@@ -380,18 +380,16 @@ class FunctionSummaries:
                 for definition_id in sources:
                     definition = index['definitions'][definition_id]
                     if definition.get('kind') == 'argument':
-                        child = add_node('argument', definition.get('argument_index'), expand=False)
+                        child = add_node('argument', definition['argument_index'], expand=False)
                     else:
                         child = add_node('definition', definition_id)
                     add_edge(node_id, child, 'one_of', 'reaching_definition')
                 continue
             if kind == 'definition':
                 definition = index['definitions'][item_id]
-                defining_operation = definition.get('operation')
-                if not defining_operation:
-                    return None
+                defining_operation = definition['operation']
                 defining = index['operations'][defining_operation]
-                if definition.get('role') == 'return_value' and defining['kind'] == 'call':
+                if definition['role'] == 'return_value' and defining['kind'] == 'call':
                     targets = []
                     for callee_id in call_targets(defining):
                         if callee_id in self.indexes:
@@ -399,7 +397,7 @@ class FunctionSummaries:
                     if targets:
                         callee_use = False
                         for use in defining.get('uses', []):
-                            if use.get('role') == 'callee':
+                            if use['role'] == 'callee':
                                 callee_use = use['id']
                                 break
                         child = add_node('operation', defining_operation, callee_use)
@@ -639,12 +637,9 @@ class DependencyGraph:
         if definition.get('kind') == 'argument':
             self.expand_argument(node_id, function_id, definition, call_stack, call_context)
             return
-        defining_operation = definition.get('operation')
-        if not defining_operation:
-            self.nodes[node_id]['unresolved'] = True
-            return
+        defining_operation = definition['operation']
         defining = index['operations'][defining_operation]
-        if definition.get('role') == 'return_value' and defining['kind'] == 'call':
+        if definition['role'] == 'return_value' and defining['kind'] == 'call':
             targets = []
             for callee_id in call_targets(defining):
                 if callee_id in self.indexes and self.indexes[callee_id]['returns']:
@@ -652,7 +647,7 @@ class DependencyGraph:
             if targets:
                 callee_use = False
                 for use in defining.get('uses', []):
-                    if use.get('role') == 'callee':
+                    if use['role'] == 'callee':
                         callee_use = use['id']
                         break
                 child = self.add_node('operation', function_id, defining_operation, callee_use, call_stack, call_context)
@@ -716,7 +711,7 @@ class DependencyGraph:
         self.add_edge(node_id, child, 'all_of', 'definition')
 
     def expand_argument(self, node_id, function_id, definition, call_stack, call_context):
-        argument_index = definition.get('argument_index')
+        argument_index = definition['argument_index']
         possible_callers = self.callers.get(function_id, [])
         matching_callers = []
         next_stack = call_stack
@@ -1049,7 +1044,7 @@ def build_program_index(functions, dataflows):
         for operation in operations.values():
             for use in operation.get('uses', []):
                 uses[use['id']] = use
-                if operation['kind'] == 'return' and use.get('role') == 'return_value':
+                if operation['kind'] == 'return' and use['role'] == 'return_value':
                     returns.append((operation['id'], use['id']))
         reaching = {}
         for edge in dataflow['edges']:

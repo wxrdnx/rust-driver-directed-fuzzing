@@ -163,8 +163,82 @@ class ConstraintBuilder:
                 values.append(self.convert(value))
             return {'kind': 'one_of', 'values': values, 'type': self.common_type(values)}
 
+        # Keep a field path as one symbolic value
+        if kind == 'projection':
+            identity = self.projection_identity(expression)
+            result_type = self.projection_type(expression)
+            if identity is None or result_type is None:
+                return self.unknown(expression, 'unsupported_projection')
+            root, projections, _ = identity
+            path = []
+            for projection in projections:
+                if projection['kind'] == 'field':
+                    path.append({'kind': 'field', 'index': projection['index']})
+                elif projection['kind'] == 'deref':
+                    path.append({'kind': 'deref'})
+                else:
+                    return self.unknown(expression, 'unsupported_projection')
+            name = root
+            for projection in path:
+                if projection['kind'] == 'field':
+                    name += f".field-{projection['index']}"
+                else:
+                    name += '.deref'
+            return {
+                'kind': 'projection',
+                'name': name,
+                'root': root,
+                'projections': path,
+                'type': self.value_type(result_type),
+            }
+
         # Unsupported expressions
         return self.unknown(expression, 'unsupported_expression')
+
+    def projection_identity(self, expression):
+        kind = expression['kind']
+        if kind == 'argument':
+            root = f"{expression['function']}:argument:{expression['index']}"
+            value_kind = expression['place']['type']['kind']
+            return root, [], value_kind in ['reference', 'raw_pointer']
+        if kind == 'projection':
+            identity = self.projection_identity(expression['base'])
+            if identity is None:
+                return None
+            root, path, pointer = identity
+            projections = list(expression['projections'])
+            if pointer and projections and projections[0]['kind'] == 'deref':
+                projections = projections[1:]
+            path += projections
+            return root, path, False
+        if kind in ['reference', 'raw_pointer']:
+            identity = self.projection_identity(expression['referent'])
+            if identity is None:
+                return None
+            root, path, _ = identity
+            return root, path, True
+        if kind == 'cast':
+            identity = self.projection_identity(expression['operand'])
+            if identity is None:
+                return None
+            root, path, _ = identity
+            target_kind = expression['type']['kind']
+            return root, path, target_kind in ['reference', 'raw_pointer']
+        return None
+
+    def projection_type(self, expression):
+        for projection in reversed(expression['projections']):
+            if 'type' in projection:
+                return projection['type']
+        base = expression['base']
+        kind = base['kind']
+        if kind == 'projection':
+            return self.projection_type(base)
+        if kind in ['argument', 'reference', 'raw_pointer']:
+            return base['place']['type']
+        if kind == 'cast':
+            return base['type']
+        return None
 
     def binary(self, expression):
         operation = expression['operation']
@@ -265,6 +339,9 @@ class ConstraintBuilder:
                 'signed': value['signed'],
             }
 
+        unsupported = {'reason': 'unsupported_type', 'type_kind': kind}
+        if unsupported not in self.unsupported:
+            self.unsupported.append(unsupported)
         return {'kind': 'unsupported', 'source': value}
 
     def common_type(self, values):
