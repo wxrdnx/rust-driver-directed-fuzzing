@@ -10,13 +10,16 @@ def analyze(cfg_path, dataflow_path, target_path, output_path):
     dataflows = read_jsonl(dataflow_path)
     with open(target_path) as file:
         target_data = json.load(file)
+
     targets = target_data.get('targets')
     if targets is None:
         targets = target_data.get('panic_sites', [])
+
     indexes, _ = build_program_index(functions, dataflows)
     resolver = ExpressionResolver(indexes)
     records = []
     counts = {'complete': 0, 'partial': 0, 'skipped': 0}
+
     for target in targets:
         function_id = target['function_id']
         use_id = None
@@ -29,13 +32,16 @@ def analyze(cfg_path, dataflow_path, target_path, output_path):
                     if use['role'] == 'condition':
                         use_id = use['id']
                         break
+
         if use_id is None:
             counts['skipped'] += 1
             continue
+
         resolved = resolver.result(function_id, use_id)
         constraint = ConstraintBuilder().assertion(resolved, target['expected'])
         counts[constraint['status']] += 1
         records.append({'target': target, 'constraint': constraint})
+
     report = {
         'schema_version': 1,
         'target_count': len(targets),
@@ -43,9 +49,11 @@ def analyze(cfg_path, dataflow_path, target_path, output_path):
         'status_counts': counts,
         'targets': records,
     }
+
     with open(output_path, 'w') as output:
         json.dump(report, output, indent=2)
         output.write('\n')
+
     return True
 
 
