@@ -735,7 +735,7 @@ fn operand_json<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, operand: &Operand<'t
                 _ => None,
             };
             let scalar = match ty.kind() {
-                ty::Bool | ty::Int(_) | ty::Uint(_) => {
+                ty::Bool | ty::Int(_) | ty::Uint(_) | ty::RawPtr(_, _) | ty::Ref(_, _, _) => {
                     constant.const_.try_to_scalar_int().or_else(|| {
                         constant
                             .const_
@@ -765,6 +765,14 @@ fn operand_json<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, operand: &Operand<'t
                         "kind": "integer",
                         "bits": value.size().bits(),
                         "signed": false,
+                        "value": value.to_uint(value.size()).to_string(),
+                    }),
+                    None => json!({"kind": "opaque"}),
+                },
+                ty::RawPtr(_, _) | ty::Ref(_, _, _) => match scalar {
+                    Some(value) => json!({
+                        "kind": "pointer",
+                        "bits": value.size().bits(),
                         "value": value.to_uint(value.size()).to_string(),
                     }),
                     None => json!({"kind": "opaque"}),

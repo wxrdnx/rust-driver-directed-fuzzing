@@ -47,12 +47,14 @@ pub(crate) fn type_json(tcx: TyCtxt<'_>, ty: Ty<'_>) -> Value {
         TyKind::Bool => json!({"kind": "boolean", "rust": format!("{ty}")}),
         TyKind::RawPtr(pointer, mutability) => json!({
             "kind": "raw_pointer",
+            "bits": tcx.data_layout.pointer_size().bits(),
             "mutable": mutability.is_mut(),
             "pointee": format!("{pointer}"),
             "rust": format!("{ty}"),
         }),
         TyKind::Ref(_, pointee, mutability) => json!({
             "kind": "reference",
+            "bits": tcx.data_layout.pointer_size().bits(),
             "mutable": mutability.is_mut(),
             "pointee": format!("{pointee}"),
             "rust": format!("{ty}"),

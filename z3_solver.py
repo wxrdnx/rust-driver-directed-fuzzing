@@ -34,6 +34,10 @@ class Z3Translator:
             return self.one_of(expression)
         if kind == 'projection':
             return self.projection(expression)
+        if kind == 'pointer':
+            return self.pointer(expression)
+        if kind == 'pointer_offset':
+            return self.pointer_offset(expression)
         if kind == 'assertion':
             condition = self.translate(expression['condition'])
             if condition is None:
@@ -47,7 +51,7 @@ class Z3Translator:
         value_type = expression['type']
         if value_type['kind'] == 'boolean':
             return z3.BoolVal(expression['value'])
-        if value_type['kind'] == 'bitvector':
+        if value_type['kind'] in ['bitvector', 'pointer']:
             return z3.BitVecVal(int(expression['value'], 0), value_type['bits'])
 
         var_type = value_type['kind']
@@ -63,7 +67,7 @@ class Z3Translator:
 
         if value_type['kind'] == 'boolean':
             variable = z3.Bool(name)
-        elif value_type['kind'] == 'bitvector':
+        elif value_type['kind'] in ['bitvector', 'pointer']:
             variable = z3.BitVec(name, value_type['bits'])
         else:
             var_type = value_type['kind']
@@ -72,7 +76,20 @@ class Z3Translator:
 
         self.variables[name] = variable
         self.variable_types[name] = value_type
+        if value_type['kind'] == 'pointer' and value_type['non_null']:
+            self.constraints.append(variable != 0)
         return variable
+
+    def pointer(self, expression):
+        return self.variable(expression)
+
+    def pointer_offset(self, expression):
+        base = self.translate(expression['base'])
+        index = self.translate(expression['index'])
+        if base is None or index is None:
+            return None
+        index = self.resize(index, base.size(), False)
+        return base + index * expression['element_size']
 
     def projection(self, expression):
         name = expression['name']
@@ -81,7 +98,7 @@ class Z3Translator:
         value_type = expression['type']
         if value_type['kind'] == 'boolean':
             variable = z3.Bool(name)
-        elif value_type['kind'] == 'bitvector':
+        elif value_type['kind'] in ['bitvector', 'pointer']:
             variable = z3.BitVec(name, value_type['bits'])
         else:
             type_kind = value_type['kind']
@@ -89,6 +106,8 @@ class Z3Translator:
             return None
         self.variables[name] = variable
         self.variable_types[name] = value_type
+        if value_type['kind'] == 'pointer' and value_type['non_null']:
+            self.constraints.append(variable != 0)
         return variable
 
     def operands(self, expression):
@@ -207,12 +226,13 @@ class Z3Translator:
 
         source_type = expression['source_type']
         target_type = expression['type']
-        if source_type['kind'] != 'bitvector' or target_type['kind'] != 'bitvector':
+        bit_types = ['bitvector', 'pointer']
+        if source_type['kind'] not in bit_types or target_type['kind'] not in bit_types:
             operation_expression = expression['operation']
             self.error = f'unsupported cast: {operation_expression}'
             return None
 
-        return self.resize(operand, target_type['bits'], source_type['signed'])
+        return self.resize(operand, target_type['bits'], source_type.get('signed', False))
 
     def resize(self, value, bits, signed):
         source_bits = value.size()
@@ -282,7 +302,7 @@ class Z3Translator:
 
         if value_type['kind'] == 'boolean':
             choice = z3.Bool(name)
-        elif value_type['kind'] == 'bitvector':
+        elif value_type['kind'] in ['bitvector', 'pointer']:
             choice = z3.BitVec(name, value_type['bits'])
         else:
             value_type = value_type['kind']
@@ -305,7 +325,7 @@ def model_value(model, variable, value_type):
     result = {'value': str(unsigned), 'type': value_type}
 
     # Convert a signed bit vector's unsigned value into a negative decimal value
-    if value_type['signed'] and unsigned >= 1 << (value_type['bits'] - 1):
+    if value_type.get('signed', False) and unsigned >= 1 << (value_type['bits'] - 1):
         result['signed_value'] = str(unsigned - (1 << value_type['bits']))
 
     return result

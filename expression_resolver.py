@@ -275,6 +275,7 @@ class ExpressionResolver:
                 }
             return {
                 'kind': 'reference',
+                'operation': operation['id'],
                 'borrow_kind': expression['borrow_kind'],
                 'place': expression['place'],
                 'referent': referent,
@@ -297,6 +298,7 @@ class ExpressionResolver:
                 }
             return {
                 'kind': 'raw_pointer',
+                'operation': operation['id'],
                 'mutability': expression['mutability'],
                 'place': expression['place'],
                 'referent': referent,

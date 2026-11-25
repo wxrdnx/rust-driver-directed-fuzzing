@@ -115,7 +115,16 @@ class ConstraintBuilder:
             value = expression['value']
             if not isinstance(value, dict):
                 return self.unknown(expression, 'unstructured_constant')
-            return self.constant(value)
+            return self.constant(value, expression['type'])
+
+        # References and raw pointers are represented by their addresses
+        if kind in ['reference', 'raw_pointer']:
+            pointer_type = expression['place']['type']
+            return {
+                'kind': 'pointer',
+                'name': expression['operation'],
+                'type': self.value_type(pointer_type),
+            }
 
         # Normalize unary operations
         if kind == 'unary':
@@ -256,6 +265,21 @@ class ConstraintBuilder:
                 'type': {'kind': 'boolean'},
             }
 
+        if operation == 'offset':
+            pointer_type = operands[0]['type']
+            element_size = self.pointee_size(pointer_type['pointee'])
+            if element_size is None:
+                unsupported = {'reason': 'unknown_pointee_size', 'pointee': pointer_type['pointee']}
+                if unsupported not in self.unsupported:
+                    self.unsupported.append(unsupported)
+            return {
+                'kind': 'pointer_offset',
+                'base': operands[0],
+                'index': operands[1],
+                'element_size': element_size,
+                'type': pointer_type,
+            }
+
         if operation in ARITHMETIC_OPERATIONS:
             normalized = ARITHMETIC_OPERATIONS[operation]
             # Division and remainder behave differently in signed & unsigned integers
@@ -299,7 +323,7 @@ class ConstraintBuilder:
             'type': self.common_type(operands),
         }
 
-    def constant(self, value):
+    def constant(self, value, source_type):
         kind = value['kind']
         if kind == 'boolean':
             return {'kind': 'constant', 'value': value['value'], 'type': {'kind': 'boolean'}}
@@ -310,6 +334,8 @@ class ConstraintBuilder:
                 'signed': value['signed'],
             }
             return {'kind': 'constant', 'value': value['value'], 'type': value_type}
+        if kind == 'pointer':
+            return {'kind': 'constant', 'value': value['value'], 'type': self.value_type(source_type)}
         return self.unknown({'kind': 'constant', 'value': value}, 'opaque_constant')
 
     def branch_constant(self, value, value_type):
@@ -339,10 +365,35 @@ class ConstraintBuilder:
                 'signed': value['signed'],
             }
 
+        if kind in ['raw_pointer', 'reference']:
+            return {
+                'kind': 'pointer',
+                'bits': value.get('bits', 64),
+                'mutable': value['mutable'],
+                'pointee': value['pointee'],
+                'non_null': value.get('non_null', kind == 'reference'),
+            }
+
         unsupported = {'reason': 'unsupported_type', 'type_kind': kind}
         if unsupported not in self.unsupported:
             self.unsupported.append(unsupported)
         return {'kind': 'unsupported', 'source': value}
+
+    def pointee_size(self, pointee):
+        sizes = {
+            'bool': 1,
+            'i8': 1,
+            'u8': 1,
+            'i16': 2,
+            'u16': 2,
+            'i32': 4,
+            'u32': 4,
+            'i64': 8,
+            'u64': 8,
+            'isize': 8,
+            'usize': 8,
+        }
+        return sizes.get(pointee)
 
     def common_type(self, values):
         for value in values:
