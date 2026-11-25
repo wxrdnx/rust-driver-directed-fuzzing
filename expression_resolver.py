@@ -1,5 +1,7 @@
 import json
 
+from intrinsic_resolver import IntrinsicResolver
+
 BINARY_OPERATIONS = {
     'add',
     'addunchecked',
@@ -146,6 +148,8 @@ class ExpressionResolver:
         arguments = {}
         for index, operand in enumerate(data['arguments']):
             arguments[index] = self.resolve_operand(function_id, operation, operand, f'argument_{index}', context)
+        if data.get('intrinsic') is not None:
+            return IntrinsicResolver().resolve(data['intrinsic'], arguments, data['destination']['type'], operation['id'])
         values = []
         for callee_id in callee_ids:
             if callee_id not in self.indexes:

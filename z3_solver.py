@@ -38,6 +38,8 @@ class Z3Translator:
             return self.pointer(expression)
         if kind == 'pointer_offset':
             return self.pointer_offset(expression)
+        if kind == 'intrinsic':
+            return self.intrinsic(expression)
         if kind == 'assertion':
             condition = self.translate(expression['condition'])
             if condition is None:
@@ -89,12 +91,106 @@ class Z3Translator:
         if base is None or index is None:
             return None
         index = self.resize(index, base.size(), False)
+        # pointer = base + i * size
         return base + index * expression['element_size']
+
+    def intrinsic(self, expression):
+        arguments = []
+        for argument in expression['arguments']:
+            translated = self.translate(argument)
+            if translated is None:
+                return None
+            arguments.append(translated)
+
+        name = expression['name']
+        if name == 'select_unpredictable':
+            return z3.If(arguments[0], arguments[1], arguments[2])
+        if name in ['saturating_add', 'saturating_sub']:
+            return self.saturating(name, arguments, expression['type'])
+        if name in ['ctlz', 'ctlz_nonzero', 'cttz', 'cttz_nonzero', 'ctpop']:
+            if name in ['ctlz_nonzero', 'cttz_nonzero']:
+                self.constraints.append(arguments[0] != 0)
+            return self.bit_count(name, arguments[0], expression['type'])
+        if name == 'bswap':
+            return self.byte_swap(arguments[0])
+        if name == 'bitreverse':
+            return self.bit_reverse(arguments[0])
+        self.error = f'unsupported intrinsic: {name}'
+
+        return None
+
+    def saturating(self, name, arguments, value_type):
+        # Saturating arithmetic clamps overflowing result to the nearest limit
+        left, right = arguments
+        bits = left.size()
+        signed = value_type['signed']
+
+        # There is no saturating arithmetic in Z3
+        # We use if-then-else expressions to clamp the result ourselves
+        if not signed and name == 'saturating_add':
+            result = left + right
+            return z3.If(z3.ULT(result, left), z3.BitVecVal((1 << bits) - 1, bits), result)
+        if not signed:
+            return z3.If(z3.ULT(left, right), z3.BitVecVal(0, bits), left - right)
+
+        wide_left = z3.SignExt(bits, left)
+        wide_right = z3.SignExt(bits, right)
+        result = wide_left + wide_right if name == 'saturating_add' else wide_left - wide_right
+
+        minimum = z3.BitVecVal(-(1 << (bits - 1)), bits * 2)
+        maximum = z3.BitVecVal((1 << (bits - 1)) - 1, bits * 2)
+
+        saturated = z3.If(result < minimum, minimum, z3.If(result > maximum, maximum, result))
+        return z3.Extract(bits - 1, 0, saturated)
+
+    def bit_count(self, name, operand, value_type):
+        input_bits = operand.size()
+        result_bits = value_type['bits']
+        # Z3 does not have a builtin ctlz
+        # Count trailing zeros by checking each bit from least significant to most significant
+        if name in ['ctlz', 'ctlz_nonzero']:
+            result = z3.BitVecVal(input_bits, result_bits)
+            for index in reversed(range(input_bits)):
+                bit = z3.Extract(input_bits - index - 1, input_bits - index - 1, operand)
+                result = z3.If(bit == 1, z3.BitVecVal(index, result_bits), result)
+            return result
+
+        # Z3 does not have a builtin cttz
+        # Count leading zeros by checking each bit from most significant to least significant
+        if name in ['cttz', 'cttz_nonzero']:
+            result = z3.BitVecVal(input_bits, result_bits)
+            for index in reversed(range(input_bits)):
+                bit = z3.Extract(index, index, operand)
+                result = z3.If(bit == 1, z3.BitVecVal(index, result_bits), result)
+            return result
+
+        result = z3.BitVecVal(0, result_bits)
+        for index in range(input_bits):
+            bit = z3.ZeroExt(result_bits - 1, z3.Extract(index, index, operand))
+            result += bit
+
+        return result
+
+    def byte_swap(self, operand):
+        bytes = []
+        for index in range(operand.size() // 8):
+            start = index * 8
+            bytes.append(z3.Extract(start + 7, start, operand))
+
+        return z3.Concat(bytes)
+
+    def bit_reverse(self, operand):
+        bits = []
+        for index in range(operand.size()):
+            bits.append(z3.Extract(index, index, operand))
+
+        return z3.Concat(bits)
 
     def projection(self, expression):
         name = expression['name']
         if name in self.variables:
             return self.variables[name]
+
         value_type = expression['type']
         if value_type['kind'] == 'boolean':
             variable = z3.Bool(name)
@@ -104,6 +200,7 @@ class Z3Translator:
             type_kind = value_type['kind']
             self.error = f'unsupported projection type: {type_kind}'
             return None
+
         self.variables[name] = variable
         self.variable_types[name] = value_type
         if value_type['kind'] == 'pointer' and value_type['non_null']:
@@ -152,7 +249,7 @@ class Z3Translator:
         left, right = operands
         operation = expression['operation']
         
-        if operation in ['shift_left', 'arithmetic_shift_right', 'logical_shift_right']:
+        if operation in ['shift_left', 'arithmetic_shift_right', 'logical_shift_right', 'rotate_left', 'rotate_right']:
             right = self.resize(right, left.size(), False)
         if operation == 'bit_and':
             return left & right
@@ -166,6 +263,10 @@ class Z3Translator:
             return left >> right
         if operation == 'logical_shift_right':
             return z3.LShR(left, right)
+        if operation == 'rotate_left':
+            return (left << right) | z3.LShR(left, left.size() - right)
+        if operation == 'rotate_right':
+            return z3.LShR(left, right) | (left << (left.size() - right))
         
         self.error = f'unsupported bit-vector operation: {operation}'
         return None

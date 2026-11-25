@@ -577,10 +577,14 @@ fn terminator_json<'tcx>(
             let callee_id = callee.map(|instance| function_id(tcx, instance.def_id()));
             let callee_instance =
                 callee.map(|instance| tcx.def_path_str_with_args(instance.def_id(), instance.args));
+            let intrinsic = callee
+                .and_then(|instance| tcx.intrinsic(instance.def_id()))
+                .map(|intrinsic| intrinsic.name.to_string());
             data = json!({
                 "callee": operand_json(tcx, body, func),
                 "callee_id": callee_id,
                 "callee_instance": callee_instance,
+                "intrinsic": intrinsic,
                 "arguments": args.iter().map(|argument| operand_json(tcx, body, &argument.node)).collect::<Vec<Value>>(),
                 "destination": place_json(tcx, body, *destination),
             });

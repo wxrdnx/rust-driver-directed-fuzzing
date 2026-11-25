@@ -19,6 +19,8 @@ BIT_OPERATIONS = {
     'shlunchecked': 'shift_left',
     'shr': 'shift_right',
     'shrunchecked': 'shift_right',
+    'rotate_left': 'rotate_left',
+    'rotate_right': 'rotate_right',
 }
 
 # MIR comparison operations
@@ -125,6 +127,20 @@ class ConstraintBuilder:
                 'name': expression['operation'],
                 'type': self.value_type(pointer_type),
             }
+
+        if kind == 'intrinsic':
+            arguments = []
+            for argument in expression['arguments']:
+                arguments.append(self.convert(argument))
+            return {
+                'kind': 'intrinsic',
+                'name': expression['name'],
+                'arguments': arguments,
+                'type': self.value_type(expression['type']),
+            }
+
+        if kind == 'opaque':
+            return self.unknown(expression, expression['reason'])
 
         # Normalize unary operations
         if kind == 'unary':
@@ -410,11 +426,17 @@ class ConstraintBuilder:
         operation = expression.get('operation')
         if operation is not None:
             record['operation'] = operation
+        for key in ['intrinsic', 'intrinsic_family']:
+            if key in expression:
+                record[key] = expression[key]
         if record not in self.unsupported:
             self.unsupported.append(record)
 
         value = {'kind': 'unknown', 'reason': reason, 'source_kind': expression['kind'], 'type': None}
         if operation is not None:
             value['operation'] = operation
+        for key in ['intrinsic', 'intrinsic_family']:
+            if key in expression:
+                value[key] = expression[key]
 
         return value

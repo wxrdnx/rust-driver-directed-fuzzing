@@ -69,7 +69,7 @@ def summarize(partial_targets):
             reasons[reason]['occurrence_count'] += 1
             reasons[reason]['targets'].add(target['target']['id'])
 
-            detail = fragment.get('rust_type') or fragment.get('operation_kind') or fragment.get('expression_kind') or fragment.get('type_kind')
+            detail = fragment.get('intrinsic') or fragment.get('rust_type') or fragment.get('operation_kind') or fragment.get('expression_kind') or fragment.get('type_kind')
             key = reason, detail
             if key not in details:
                 details[key] = {'reason': reason, 'detail': detail, 'occurrence_count': 0, 'targets': set()}
