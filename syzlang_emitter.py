@@ -27,7 +27,7 @@ def target_record(report, target_id):
         if record['target']['id'] == target_id:
             return record
 
-def build_context(constraints, solutions, target_id, descriptions):
+def build_context(constraints, solutions, target_id, descriptions, reachability=None):
 
     # The context fed into LLM include
     # - target constraint
@@ -49,6 +49,8 @@ def build_context(constraints, solutions, target_id, descriptions):
     for path in descriptions:
         with open(path) as file:
             context['relevant_syzlang'][os.path.basename(path)] = file.read()
+    if reachability is not None:
+        context['backward_call_tracing'] = reachability
     return context
 
 def call_llm(prompt, api_base, api_key, model, timeout):
@@ -144,6 +146,7 @@ def main():
     parser.add_argument('target_id')
     parser.add_argument('output_dir')
     parser.add_argument('--description', action='append', required=True)
+    parser.add_argument('--reachability')
     parser.add_argument('--syzkaller', default='syzkaller-src')
     parser.add_argument('--target', default='linux/amd64')
     parser.add_argument('--api-base', default='https://api.openai.com/v1')
@@ -156,7 +159,10 @@ def main():
     for path in args.description:
         descriptions.append(path)
 
-    context = build_context(read_json(args.constraints), read_json(args.solutions), args.target_id, descriptions)
+    reachability = None
+    if args.reachability:
+        reachability = read_json(args.reachability)
+    context = build_context(read_json(args.constraints), read_json(args.solutions), args.target_id, descriptions, reachability)
 
     if context is None:
         print(f'target {args.target_id} missing from the analysis results')
