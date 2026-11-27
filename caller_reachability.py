@@ -5,13 +5,70 @@ from collections import Counter, deque
 
 from backward_slice import build_program_index, read_jsonl
 
+def add_c_callers(functions, callers, analysis_paths):
+    # Connects C call graph to Rust call graph
+    # Assume LLVM reports the direct call:
+    #     __do_sys_ioctl -> vfs_ioctl
+    # And assume callback analysis (syscall_discovery.py) resolves:
+    #     vfs_ioctl -> rust_binder_ioctl
+    # Backward slicing can then continue across the Rust-C border:
+    #     panic -> Rust helper -> rust_binder_ioctl -> vfs_ioctl -> __do_sys_ioctl -> ioctl
+
+    # Load the C analysis file
+    records = []
+    calls = []
+    for path in analysis_paths:
+        with open(path) as file:
+            analysis = json.load(file)
+        records.extend(analysis['function_records'])
+        calls.extend(analysis['calls'])
+
+    # Index Rust functions
+    functions_by_symbol = {}
+    for function in functions:
+        metadata = function['function']
+        for symbol in [metadata['name'], metadata['linkage_name']]:
+            if symbol is None:
+                continue
+            if symbol not in functions_by_symbol:
+                functions_by_symbol[symbol] = []
+            functions_by_symbol[symbol].append(metadata['id'])
+
+    # Add the C functions to the same index
+    for record in records:
+        functions.append({'function': record})
+        symbol = record['linkage_name']
+        if symbol not in functions_by_symbol:
+            functions_by_symbol[symbol] = []
+        functions_by_symbol[symbol].append(record['id'])
+
+    # Collect all function IDs and examine record emitted by the C LLVM analyzer
+    function_ids = set()
+    for function in functions:
+        function_ids.add(function['function']['id'])
+    for call in calls:
+        # We only care about direct calls currently
+        # TODO: indirect calls
+        if call['call_kind'] != 'direct':
+            continue
+
+        targets = []
+        if call['callee_id'] in function_ids:
+            targets.append(call['callee_id'])
+        else:
+            targets.extend(functions_by_symbol.get(call['callee_symbol'], []))
+        for target in targets:
+            if target not in callers:
+                callers[target] = []
+            callers[target].append({ 'function': call['caller_id'], 'operation': None, 'arguments': {}})
+
 def discover_entries(functions, registration_paths):
 
     # First index all analyzed Rust functions
     functions_by_name = {}
     for function in functions:
         metadata = function['function']
-        for name in [metadata['name'], metadata['linkage_name']]:
+        for name in [metadata['id'], metadata['name'], metadata['linkage_name']]:
             if name is None:
                 continue
             if name not in functions_by_name:
@@ -24,10 +81,15 @@ def discover_entries(functions, registration_paths):
         with open(path) as file:
             analysis = json.load(file)
         for registration in analysis['callback_registrations']:
-            for function_id in functions_by_name.get(registration['callback'], []):
+            function_ids = []
+            if registration['callback_id'] in functions_by_name:
+                function_ids.extend(functions_by_name[registration['callback_id']])
+            function_ids.extend(functions_by_name.get(registration['callback'], []))
+            for function_id in function_ids:
                 if function_id not in entries:
                     entries[function_id] = []
-                entries[function_id].append(registration)
+                if registration not in entries[function_id]:
+                    entries[function_id].append(registration)
 
     return entries
 
@@ -82,7 +144,7 @@ def trace_target(target, callers, names, entries):
         'visited_function_count': len(visited),
     }
 
-def analyze(cfg_path, dataflow_path, target_path, registration_paths, output_path):
+def analyze(cfg_path, dataflow_path, target_path, registration_paths, c_analysis_paths, output_path):
 
     functions = read_jsonl(cfg_path)
     dataflows = read_jsonl(dataflow_path)
@@ -90,12 +152,14 @@ def analyze(cfg_path, dataflow_path, target_path, registration_paths, output_pat
         target_data = json.load(file)
 
     _, callers = build_program_index(functions, dataflows)
+    add_c_callers(functions, callers, c_analysis_paths)
     names = {}
     for function in functions:
         function_id = function['function']['id']
         name = function['function']['name']
         names[function_id] = name
 
+    # Match the callback symbol to Rust functions
     entries = discover_entries(functions, registration_paths)
 
     results = []
@@ -125,7 +189,8 @@ if __name__ == '__main__':
     parser.add_argument('targets')
     parser.add_argument('output')
     parser.add_argument('--registrations', nargs='+', required=True)
+    parser.add_argument('--c-analysis', nargs='*', default=[])
     args = parser.parse_args()
 
-    if not analyze(args.cfg, args.dataflow, args.targets, args.registrations, args.output):
+    if not analyze(args.cfg, args.dataflow, args.targets, args.registrations, args.c_analysis, args.output):
         sys.exit(1)

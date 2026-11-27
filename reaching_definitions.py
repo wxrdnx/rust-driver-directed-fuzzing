@@ -212,20 +212,44 @@ def fixed_point(function, arguments):
                 inputs[block_id] = incoming
                 outputs[block_id] = outgoing
                 changed = True
+
     return inputs
 
 def reaching_for_use(state, use):
+    # Finds which definitions may end up with value of an use
+    # e.g.,
+    #     _1 = 10       def A
+    #     _1 = 20       def B on another branch
+    #     _2 = _1 + 1   use of _1
+    # At use of _1, the current state could contain:
+    # {
+    #     ('_1', ()): {'def-A', 'def-B'}
+    # }
+    # 
+    # So it returns {'def-A', 'def-B'}
+
     key = place_key(use['place'])
     definitions = set()
     for current, current_definitions in state.items():
         if places_overlap(current, key):
             definitions |= current_definitions
+
     return definitions
 
 def resolve_uses(function, inputs):
+    # From the result of reaching_for_use, create the def-use edges
+    # e.g.,
+    #     _1 = 10       def A
+    #     _1 = 20       def B on another branch
+    #     _2 = _1 + 1   use of _1
+    #
+    # Returns the following:
+    #     def-A -> use of _1
+    #     def-B -> use of _1
+
     edges = []
     unresolved = []
-    seen = set()
+    edge_seen = set()
     for block in function['blocks']:
         state = copy_state(inputs[block['id']])
 
@@ -240,21 +264,26 @@ def resolve_uses(function, inputs):
         for operation in operations:
             for use in operation.get('uses', []):
                 definitions = reaching_for_use(state, use)
+
                 if not definitions:
                     unresolved.append(use)
+
                 for definition in definitions:
                     edge = definition, use['id']
-                    if edge in seen:
+                    if edge in edge_seen:
                         continue
-                    seen.add(edge)
+                    edge_seen.add(edge)
                     edges.append({'source': definition, 'target': use['id'], 'kind': 'def_use'})
+
             apply_operation(state, operation)
+
     return edges, unresolved
 
 def analyze_function(function):
     arguments = argument_definitions(function)
     inputs = fixed_point(function, arguments)
     edges, unresolved = resolve_uses(function, inputs)
+
     return {
         'record': 'function_dataflow',
         'schema_version': 1,
@@ -269,7 +298,6 @@ def analyze(input_path, output_path):
         for function in read_cfgs(input_path):
             dataflow = analyze_function(function)
             output.write(json.dumps(dataflow, separators=(',', ':')) + '\n')
-    return True
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
